@@ -12,19 +12,26 @@ services:
       PORT: 8880
       WORKERS: 1
       CORS_ORIGINS: "${CORS_ORIGINS:-*}"
-      TTS_BACKEND: official
-      TTS_MODEL_NAME: "${TTS_MODEL_NAME:-Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice}"
+      # TTS_BACKEND: official
+      TTS_BACKEND: optimized
+      # TTS_MODEL_NAME: "${TTS_MODEL_NAME:-Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice}"
+      TTS_MODEL_NAME: "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
       TTS_WARMUP_ON_START: "${TTS_WARMUP_ON_START:-false}"
       TTS_IDLE_TIMEOUT_SECONDS: "${TTS_IDLE_TIMEOUT_SECONDS:-0}"
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      VOICE_LIBRARY_DIR: /VOICES
+      TORCHINDUCTOR_COMPILE_THREADS: 1
     volumes:
       - "${HF_CACHE_DIR:-~/.cache/huggingface}:/home/appuser/.cache/huggingface"
+      - ./VOICES:/VOICES
+      - ./config.yaml:/home/appuser/qwen3-tts/config.yaml
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              # count: 1
+              device_ids: ["1"]
               capabilities: [gpu]
     restart: unless-stopped
     healthcheck:

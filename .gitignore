@@ -25,6 +25,8 @@ env/
 .venv/
 .python-version
 uv.lock
+.env
+.devcontainer
 
 # Audio output files
 output/
@@ -41,3 +43,5 @@ output/
 CLAUDE.md
 # Runtime server logs
 server_*.log
+
+VOICES/

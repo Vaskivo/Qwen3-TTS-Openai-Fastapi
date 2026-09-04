@@ -3,7 +3,8 @@
 # The optimized backend reads this file at startup.
 
 # Model to load on first request (must match a key in the `models` section below)
-default_model: 0.6B-CustomVoice
+# default_model: 0.6B-CustomVoice
+default_model: 1.7B-Base
 
 # Available models.  Each entry maps a short name to a HuggingFace repo id (or
 # a local path) and a model type ("customvoice" or "base").
@@ -32,11 +33,14 @@ optimization:
 
   # torch.compile mode.  Options: default | reduce-overhead | max-autotune
   # max-autotune gives the best throughput after a ~75 s compilation on first start.
-  compile_mode: max-autotune
+  # compile_mode: max-autotune
+  compile_mode: default
+
 
   # Whether to enable torch.compile at all.  Set to false to skip compilation
   # (faster startup, lower throughput).
-  use_compile: true
+  # use_compile: true
+  use_compile: false
 
   # Whether to capture CUDA graphs (works on both CUDA and ROCm).
   # Required for max-autotune to reach peak performance.
