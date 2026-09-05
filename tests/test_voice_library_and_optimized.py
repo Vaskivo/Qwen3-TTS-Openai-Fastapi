@@ -217,10 +217,11 @@ class TestOptimizedBackendSelection:
         except Exception:
             pass
 
-    def test_optimized_backend_selected(self, monkeypatch):
+    def test_optimized_backend_selected(self, tmp_path, monkeypatch):
         """TTS_BACKEND=optimized returns OptimizedQwen3TTSBackend."""
         pytest.importorskip("torch")
         monkeypatch.setenv("TTS_BACKEND", "optimized")
+        _write_config(tmp_path, monkeypatch, _base_config())
 
         from api.backends.factory import get_backend, reset_backend
         reset_backend()
@@ -230,9 +231,10 @@ class TestOptimizedBackendSelection:
         assert isinstance(backend, OptimizedQwen3TTSBackend)
         assert backend.get_backend_name() == "optimized"
 
-    def test_optimized_backend_implements_interface(self):
+    def test_optimized_backend_implements_interface(self, tmp_path, monkeypatch):
         """OptimizedQwen3TTSBackend implements the TTSBackend interface."""
         pytest.importorskip("torch")
+        _write_config(tmp_path, monkeypatch, _base_config())
         from api.backends.optimized_backend import OptimizedQwen3TTSBackend
         from api.backends.base import TTSBackend
 
@@ -251,17 +253,19 @@ class TestOptimizedBackendSelection:
         assert hasattr(backend, "is_ready")
         assert hasattr(backend, "get_device_info")
 
-    def test_optimized_backend_supports_voice_cloning(self):
+    def test_optimized_backend_supports_voice_cloning(self, tmp_path, monkeypatch):
         """OptimizedQwen3TTSBackend reports voice cloning as supported."""
         pytest.importorskip("torch")
+        _write_config(tmp_path, monkeypatch, _base_config())
         from api.backends.optimized_backend import OptimizedQwen3TTSBackend
 
         backend = OptimizedQwen3TTSBackend()
         assert backend.supports_voice_cloning() is True
 
-    def test_optimized_backend_not_ready_initially(self):
+    def test_optimized_backend_not_ready_initially(self, tmp_path, monkeypatch):
         """OptimizedQwen3TTSBackend is not ready before initialize() is called."""
         pytest.importorskip("torch")
+        _write_config(tmp_path, monkeypatch, _base_config())
         from api.backends.optimized_backend import OptimizedQwen3TTSBackend
 
         backend = OptimizedQwen3TTSBackend()
@@ -274,8 +278,11 @@ class TestOptimizedBackendSelection:
 
         config = {
             "default_model": "my-model",
+            "voice_clone_model": "my-base",
+            "load_both_models": False,
             "models": {
-                "my-model": {"hf_id": "test/model", "type": "customvoice"}
+                "my-model": {"hf_id": "test/model", "type": "customvoice"},
+                "my-base": {"hf_id": "test/base", "type": "base"},
             },
         }
         config_file = tmp_path / "config.yaml"
@@ -288,6 +295,176 @@ class TestOptimizedBackendSelection:
 
         backend = OptimizedQwen3TTSBackend()
         assert backend._default_model_key() == "my-model"
+        assert backend._voice_clone_model_key() == "my-base"
+        assert backend._load_both_models() is False
+        assert backend.get_loaded_model_keys() == []
+
+
+# ---------------------------------------------------------------------------
+# Config validation + per-purpose model selection + dual-resident behaviour
+# ---------------------------------------------------------------------------
+
+
+def _write_config(tmp_path, monkeypatch, config: dict) -> None:
+    """Write a config dict to a temp config.yaml and point TTS_CONFIG at it."""
+    import yaml
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump(config))
+    monkeypatch.setenv("TTS_CONFIG", str(config_file))
+
+
+def _base_config() -> dict:
+    return {
+        "default_model": "cv",
+        "voice_clone_model": "base",
+        "load_both_models": False,
+        "models": {
+            "cv": {"hf_id": "test/cv", "type": "customvoice"},
+            "base": {"hf_id": "test/base", "type": "base"},
+        },
+    }
+
+
+class TestPerPurposeModelConfig:
+    """Validates required config keys, the voice_clone_model resolver, and the
+    keep-vs-swap behaviour of _ensure_model_loaded under load_both_models."""
+
+    def test_voice_clone_model_key_returns_configured_value(self, tmp_path, monkeypatch):
+        pytest.importorskip("torch")
+        _write_config(tmp_path, monkeypatch, _base_config())
+        from api.backends.optimized_backend import OptimizedQwen3TTSBackend
+
+        backend = OptimizedQwen3TTSBackend()
+        assert backend._voice_clone_model_key() == "base"
+        assert backend._default_model_key() == "cv"
+
+    def test_missing_voice_clone_model_raises(self, tmp_path, monkeypatch):
+        pytest.importorskip("torch")
+        cfg = _base_config()
+        del cfg["voice_clone_model"]
+        _write_config(tmp_path, monkeypatch, cfg)
+        from api.backends.optimized_backend import OptimizedQwen3TTSBackend
+
+        with pytest.raises(ValueError, match="voice_clone_model"):
+            OptimizedQwen3TTSBackend()
+
+    def test_voice_clone_model_must_be_base_type(self, tmp_path, monkeypatch):
+        pytest.importorskip("torch")
+        cfg = _base_config()
+        cfg["voice_clone_model"] = "cv"  # customvoice, not base
+        _write_config(tmp_path, monkeypatch, cfg)
+        from api.backends.optimized_backend import OptimizedQwen3TTSBackend
+
+        with pytest.raises(ValueError, match="base"):
+            OptimizedQwen3TTSBackend()
+
+    def test_missing_load_both_models_raises(self, tmp_path, monkeypatch):
+        pytest.importorskip("torch")
+        cfg = _base_config()
+        del cfg["load_both_models"]
+        _write_config(tmp_path, monkeypatch, cfg)
+        from api.backends.optimized_backend import OptimizedQwen3TTSBackend
+
+        with pytest.raises(ValueError, match="load_both_models"):
+            OptimizedQwen3TTSBackend()
+
+    def test_load_both_models_non_bool_raises(self, tmp_path, monkeypatch):
+        pytest.importorskip("torch")
+        cfg = _base_config()
+        cfg["load_both_models"] = "yes"
+        _write_config(tmp_path, monkeypatch, cfg)
+        from api.backends.optimized_backend import OptimizedQwen3TTSBackend
+
+        with pytest.raises(ValueError, match="boolean"):
+            OptimizedQwen3TTSBackend()
+
+    def test_missing_default_model_raises(self, tmp_path, monkeypatch):
+        pytest.importorskip("torch")
+        cfg = _base_config()
+        del cfg["default_model"]
+        _write_config(tmp_path, monkeypatch, cfg)
+        from api.backends.optimized_backend import OptimizedQwen3TTSBackend
+
+        with pytest.raises(ValueError, match="default_model"):
+            OptimizedQwen3TTSBackend()
+
+    def test_default_model_must_be_customvoice_type(self, tmp_path, monkeypatch):
+        pytest.importorskip("torch")
+        cfg = _base_config()
+        cfg["default_model"] = "base"  # base, not customvoice
+        _write_config(tmp_path, monkeypatch, cfg)
+        from api.backends.optimized_backend import OptimizedQwen3TTSBackend
+
+        with pytest.raises(ValueError, match="customvoice"):
+            OptimizedQwen3TTSBackend()
+
+
+class TestEnsureModelLoadedResidency:
+    """_ensure_model_loaded keeps vs. swaps resident models based on
+    load_both_models, using a mocked Qwen3TTSModel.from_pretrained."""
+
+    def _make_backend(self, tmp_path, monkeypatch, load_both: bool):
+        pytest.importorskip("torch")
+        cfg = _base_config()
+        cfg["load_both_models"] = load_both
+        # Disable torch.compile path so _apply_optimizations is skipped.
+        cfg.setdefault("optimization", {})["use_compile"] = False
+        _write_config(tmp_path, monkeypatch, cfg)
+
+        from api.backends import optimized_backend
+
+        def _fake_from_pretrained(hf_id, **kwargs):
+            m = MagicMock()
+            m._hf_id = hf_id
+            return m
+
+        monkeypatch.setattr(
+            optimized_backend, "__import__", __import__, raising=False
+        )
+        # Patch the from_pretrained via patching the module-level import site.
+        import qwen_tts  # noqa: F401  (ensure importable; tests skip if absent)
+        monkeypatch.setattr(
+            qwen_tts.Qwen3TTSModel, "from_pretrained",
+            staticmethod(_fake_from_pretrained),
+        )
+        backend = optimized_backend.OptimizedQwen3TTSBackend()
+        return backend
+
+    def test_swap_unloads_previous_model_when_not_both(self, tmp_path, monkeypatch):
+        backend = self._make_backend(tmp_path, monkeypatch, load_both=False)
+        import asyncio
+
+        asyncio.run(backend._ensure_model_loaded("cv"))
+        assert backend.get_loaded_model_keys() == ["cv"]
+        assert backend.current_model_key == "cv"
+
+        asyncio.run(backend._ensure_model_loaded("base"))
+        assert backend.get_loaded_model_keys() == ["base"]
+        assert backend.current_model_key == "base"
+        assert backend.is_ready()
+
+    def test_both_keeps_resident_models(self, tmp_path, monkeypatch):
+        backend = self._make_backend(tmp_path, monkeypatch, load_both=True)
+        import asyncio
+
+        asyncio.run(backend._ensure_model_loaded("cv"))
+        asyncio.run(backend._ensure_model_loaded("base"))
+        assert sorted(backend.get_loaded_model_keys()) == ["base", "cv"]
+
+        # Switching back to cv must NOT unload base.
+        asyncio.run(backend._ensure_model_loaded("cv"))
+        assert sorted(backend.get_loaded_model_keys()) == ["base", "cv"]
+        assert backend.current_model_key == "cv"
+
+    def test_already_resident_just_moves_active_pointer(self, tmp_path, monkeypatch):
+        backend = self._make_backend(tmp_path, monkeypatch, load_both=True)
+        import asyncio
+
+        asyncio.run(backend._ensure_model_loaded("cv"))
+        first_model = backend.model
+        asyncio.run(backend._ensure_model_loaded("cv"))
+        assert backend.model is first_model
+        assert backend.current_model_key == "cv"
 
 
 # ---------------------------------------------------------------------------

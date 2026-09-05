@@ -21,9 +21,29 @@ def client():
 
 
 @pytest.fixture(autouse=True)
-def reset_backend_after_test():
-    """Reset backend after each test."""
+def reset_backend_after_test(tmp_path, monkeypatch):
+    """Provide a valid optimized-backend config and reset backend state.
+
+    The optimized backend now requires `default_model`, `voice_clone_model`
+    and `load_both_models` keys in config.yaml, so tests that touch
+    `get_backend()` need a real config file pointed at by TTS_CONFIG.
+    """
+    import yaml
+    config = {
+        "default_model": "cv",
+        "voice_clone_model": "base",
+        "load_both_models": False,
+        "models": {
+            "cv": {"hf_id": "test/cv", "type": "customvoice"},
+            "base": {"hf_id": "test/base", "type": "base"},
+        },
+    }
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump(config))
+    monkeypatch.setenv("TTS_CONFIG", str(config_file))
+
     yield
+
     reset_backend()
 
 

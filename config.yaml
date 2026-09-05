@@ -2,9 +2,23 @@
 # Copy this file to ~/qwen3-tts/config.yaml (or point TTS_CONFIG to its location).
 # The optimized backend reads this file at startup.
 
-# Model to load on first request (must match a key in the `models` section below)
+# Model to load for NON-clone requests (built-in voices, custom voices).
+# Must match a key in the `models` section below.  Non-clone generation uses
+# generate_custom_voice, so this must be a `customvoice`-type model.
 # default_model: 0.6B-CustomVoice
-default_model: 1.7B-Base
+default_model: 1.7B-CustomVoice
+
+# Model to load for voice-cloning requests (clone: prefix, voice library,
+# /v1/audio/voice-clone).  Must be a `base`-type model from `models` below.
+voice_clone_model: 1.7B-Base
+
+# Whether to keep both `default_model` and `voice_clone_model` resident in
+# VRAM at the same time.
+#   true  — load both once (lazily on first use, or eagerly at startup when
+#           TTS_WARMUP_ON_START=true); no model swapping afterward.
+#   false — keep only one model loaded at a time; switch (unload + load) when a
+#           request needs the other model.  Lower VRAM, higher per-switch latency.
+load_both_models: false
 
 # Available models.  Each entry maps a short name to a HuggingFace repo id (or
 # a local path) and a model type ("customvoice" or "base").
@@ -12,17 +26,17 @@ default_model: 1.7B-Base
 # - customvoice  — predefined speakers (Vivian, Ryan, …); fastest for bulk TTS
 # - base         — required for voice cloning (clone: prefix) and voice library
 models:
+  1.7B-Base:
+    hf_id: Qwen/Qwen3-TTS-12Hz-1.7B-Base
+    type: base
+  1.7B-CustomVoice:
+    hf_id: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+    type: customvoice
   0.6B-CustomVoice:
     hf_id: Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
     type: customvoice
   0.6B-Base:
     hf_id: Qwen/Qwen3-TTS-12Hz-0.6B-Base
-    type: base
-  1.7B-CustomVoice:
-    hf_id: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
-    type: customvoice
-  1.7B-Base:
-    hf_id: Qwen/Qwen3-TTS-12Hz-1.7B-Base
     type: base
 
 # Performance optimizations (only used with TTS_BACKEND=optimized)
