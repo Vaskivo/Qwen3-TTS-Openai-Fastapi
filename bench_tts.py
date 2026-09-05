@@ -12,11 +12,6 @@ Usage:
     docker compose down
     docker compose up -d --build qwen3-tts-gpu
     python3 bench_tts.py | tee bench_official.txt
-    
-    # Benchmark vLLM-Omni backend
-    docker compose down
-    docker compose --profile vllm up -d --build qwen3-tts-vllm
-    python3 bench_tts.py | tee bench_vllm.txt
 """
 
 import io

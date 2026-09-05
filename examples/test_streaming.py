@@ -22,7 +22,6 @@ clone_model = Qwen3TTSModel.from_pretrained(
 )
 start = log_time(start, "Load Base model")
 
-# for real speedup, use vLLM for LM inference (or SGlang probably)
 # torch.compile doesn't help much for autoregressive generation due to dynamic shapes
 
 ref_audio_path = "kuklina-1.wav"

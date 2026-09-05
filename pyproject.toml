@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "qwen-tts"
 version = "0.1.1"
-description = "Qwen3-TTS with OpenAI-compatible FastAPI, voice cloning, and multiple inference backends"
+description = "Qwen3-TTS with OpenAI-compatible FastAPI, voice cloning, official and optimized backends"
 readme = "README.md"
 requires-python = ">=3.10"
 classifiers = [
@@ -42,16 +42,6 @@ api = [
   "aiofiles",
   "pydub",
   "httpx>=0.24.0",
-]
-vllm = [
-  "vllm>=0.4.0",
-]
-mlx = [
-  # mlx-audio 0.3.x pins a Transformers 5 release candidate. Use this extra
-  # in a dedicated Apple Silicon environment rather than mixing it with the
-  # official/CPU backend environment that pins Transformers 4.57.3.
-  "mlx-audio>=0.3.0; sys_platform == 'darwin' and platform_machine == 'arm64' and python_version >= '3.10'",
-  "huggingface_hub[hf_xet]; sys_platform == 'darwin' and platform_machine == 'arm64' and python_version >= '3.10'",
 ]
 dev = [
   "pytest>=7.0.0",

@@ -1,6 +1,6 @@
 # Qwen3-TTS OpenAI-Compatible FastAPI Server
 
-Serve Qwen3-TTS behind the OpenAI `POST /v1/audio/speech` interface, with optional voice cloning, saved voice profiles, real-time PCM streaming, CUDA/ROCm/CPU backends, and native Apple Silicon support.
+Serve Qwen3-TTS behind the OpenAI `POST /v1/audio/speech` interface, with optional voice cloning, saved voice profiles, real-time PCM streaming, and CUDA/ROCm backends.
 
 This repository is based on the Qwen3-TTS implementation from the Alibaba Qwen team and adds an API/deployment layer intended for local applications and self-hosted services.
 
@@ -9,12 +9,12 @@ This repository is based on the Qwen3-TTS implementation from the Alibaba Qwen t
 - OpenAI-compatible `POST /v1/audio/speech`
 - Model and voice discovery under `/v1/models` and `/v1/voices`
 - MP3, Opus, AAC, FLAC, WAV, and signed 16-bit PCM output
-- Official, optimized, vLLM-Omni, PyTorch CPU, OpenVINO, and MLX backends
+- Official and optimized backends
 - Base-model voice cloning through `/v1/audio/voice-clone`
 - Persistent voice-library profiles through `voice="clone:ProfileName"`
 - Lazy model loading, bounded generation concurrency, warmup, and health checks
 - Automatic long-text chunking with punctuation-aware boundaries
-- Docker, NVIDIA GPU, AMD ROCm, CPU, and Apple Silicon deployment paths
+- Docker, NVIDIA GPU, and AMD ROCm deployment paths
 - Optional Gradio Voice Studio and browser interface
 
 ## Important: choose the correct model type
@@ -228,10 +228,6 @@ Set `TTS_BACKEND` before starting the server.
 |---|---|---|
 | Official | `official` | Default, broad feature compatibility |
 | Optimized | `optimized` | GPU production, model switching, native PCM streaming, voice library |
-| vLLM-Omni | `vllm_omni` | Dedicated high-throughput vLLM deployment |
-| PyTorch CPU | `pytorch` | CPU-only systems |
-| OpenVINO | `openvino` | Experimental exported-model path |
-| Apple MLX | `mlx` | Native Apple Silicon deployment |
 
 ### Official backend
 
@@ -253,36 +249,6 @@ TTS_BACKEND=optimized python -m api.main
 ```
 
 Edit the model entries in `config.yaml` to use Hugging Face IDs or local paths. The configured `type` must match the checkpoint: `customvoice` or `base`.
-
-### vLLM-Omni
-
-Use the dedicated environment/image because vLLM has strict CUDA and package compatibility requirements.
-
-```bash
-TTS_BACKEND=vllm_omni \
-TTS_MODEL_NAME=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
-TTS_WARMUP_ON_START=true \
-python -m api.main
-```
-
-See `docs/vllm-backend.md` and `VLLM_BACKEND_STATUS.md` for backend-specific constraints.
-
-### CPU backend
-
-The default CPU checkpoint is the smaller 0.6B **CustomVoice** model, which supports normal preset-speaker TTS.
-
-```bash
-export TTS_BACKEND=pytorch
-export TTS_MODEL_NAME=Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
-export TTS_DEVICE=cpu
-export TTS_DTYPE=float32
-export TTS_ATTN=sdpa
-export CPU_THREADS=12
-export CPU_INTEROP=2
-python -m api.main
-```
-
-A Base checkpoint is valid for `/v1/audio/voice-clone`, but it cannot serve preset-speaker `/v1/audio/speech` calls.
 
 ## Voice cloning
 
@@ -365,32 +331,6 @@ response.stream_to_file("alice.wav")
 
 The active backend/checkpoint must support voice cloning. See `docs/voice-library.md` for details.
 
-## Apple Silicon / MLX
-
-Use a dedicated virtual environment because `mlx-audio` can require a different Transformers version from the official backend stack.
-
-```bash
-brew install python@3.12 ffmpeg
-python3.12 -m venv .venv-mlx
-source .venv-mlx/bin/activate
-pip install --upgrade pip
-pip install -e ".[api,mlx]"
-
-TTS_BACKEND=mlx \
-MLX_MODEL_ID=mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit \
-python -m api.main
-```
-
-The included launcher manages isolated 0.6B and 1.7B MLX instances:
-
-```bash
-./run_tts.sh          # 1.7B HQ on port 18882
-./run_tts.sh fast     # 0.6B on port 18881
-./run_tts.sh both
-./run_tts.sh status
-./run_tts.sh stop
-```
-
 ## Docker
 
 ### NVIDIA GPU
@@ -408,18 +348,6 @@ docker compose up --build qwen3-tts-gpu
 ```
 
 The Compose file requests one GPU instead of hard-coding a host GPU index.
-
-### vLLM
-
-```bash
-docker compose --profile vllm up --build qwen3-tts-vllm
-```
-
-### CPU
-
-```bash
-CPU_THREADS=12 docker compose --profile cpu up --build qwen3-tts-cpu
-```
 
 ### AMD ROCm
 
@@ -453,12 +381,8 @@ Review device mappings in `docker-compose.rocm.yml`; render-node names vary betw
 | `TTS_MIN_CHUNK_CHARS` | `20` | Soft minimum chunk length |
 | `TTS_MAX_CHUNK_CHARS` | `70` | Target maximum chunk length |
 | `TTS_CHUNK_GAP_MS` | `120` | Silence inserted between generated chunks |
-| `CPU_THREADS` | `12` | PyTorch CPU thread count |
-| `CPU_INTEROP` | `2` | PyTorch inter-op thread count |
-| `USE_IPEX` | `false` | Attempt Intel Extension for PyTorch |
-| `MLX_MODEL_ID` | 0.6B CustomVoice 8-bit | MLX checkpoint |
 
-Invalid integer settings fall back to safe defaults instead of crashing module import.
+Invalid float settings fall back to safe defaults instead of crashing module import.
 
 ## CORS and network exposure
 
@@ -510,7 +434,6 @@ TTS_LAZY_LOAD=false TTS_WARMUP_ON_START=true python -m api.main
 - Keep `WORKERS=1`
 - Keep `TTS_MAX_CONCURRENT=1`
 - Stop other GPU workloads
-- Avoid running both MLX launch profiles when unified memory is constrained
 
 ### Server exits while idle
 
@@ -526,10 +449,9 @@ api/
 ├── static/                   Browser UI
 └── structures/               Pydantic request/response schemas
 config.yaml                   Optimized-backend model/performance config
-docker-compose.yml            NVIDIA and CPU services
+docker-compose.yml            NVIDIA GPU service
 docker-compose.rocm.yml       AMD ROCm service
 gradio_voice_studio.py        Voice Studio
-run_tts.sh                    Isolated MLX launch helper
 tests/                        Regression and API tests
 ```
 

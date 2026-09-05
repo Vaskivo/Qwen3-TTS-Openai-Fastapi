@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import numpy as np
 
 from api.backends.official_qwen3_tts import OfficialQwen3TTSBackend
-from api.backends.vllm_omni_qwen3_tts import VLLMOmniQwen3TTSBackend
+from api.backends.base import TTSBackend
 from api.backends.factory import reset_backend
 
 
@@ -40,16 +40,6 @@ class TestBaseCustomVoiceInterface:
     def test_get_custom_voice_names_empty_by_default(self):
         backend = OfficialQwen3TTSBackend()
         assert backend.get_custom_voice_names() == []
-
-    @pytest.mark.asyncio
-    async def test_generate_speech_with_custom_voice_raises_on_base(self):
-        """Base class should raise NotImplementedError."""
-        # Use vLLM backend since it doesn't override the method
-        backend = VLLMOmniQwen3TTSBackend()
-        with pytest.raises(NotImplementedError):
-            await backend.generate_speech_with_custom_voice(
-                text="hello", voice="test", language="Auto", speed=1.0
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -411,46 +401,6 @@ class TestGetSupportedVoicesIncludesCustom:
         assert "Vivian" in voices
         # Custom voice should be appended
         assert "MyClone" in voices
-
-
-# ---------------------------------------------------------------------------
-# vLLM backend — load_custom_voices warns only
-# ---------------------------------------------------------------------------
-
-class TestVllmCustomVoices:
-
-    @pytest.mark.asyncio
-    async def test_warns_when_voice_dirs_exist(self, tmp_path, caplog):
-        """vLLM backend should warn if custom voice folders are present."""
-        voice_dir = tmp_path / "SomeVoice"
-        voice_dir.mkdir()
-
-        backend = VLLMOmniQwen3TTSBackend()
-
-        import logging
-        with caplog.at_level(logging.WARNING):
-            await backend.load_custom_voices(str(tmp_path))
-
-        assert "does not support voice cloning" in caplog.text
-        assert backend.get_custom_voice_names() == []
-
-    @pytest.mark.asyncio
-    async def test_no_warn_for_empty_dir(self, tmp_path, caplog):
-        """No warning if the custom voices directory has no subdirs."""
-        backend = VLLMOmniQwen3TTSBackend()
-
-        import logging
-        with caplog.at_level(logging.WARNING):
-            await backend.load_custom_voices(str(tmp_path))
-
-        assert "does not support voice cloning" not in caplog.text
-
-    @pytest.mark.asyncio
-    async def test_nonexistent_dir_is_noop(self, tmp_path):
-        """Non-existent directory should silently do nothing."""
-        backend = VLLMOmniQwen3TTSBackend()
-        await backend.load_custom_voices(str(tmp_path / "nope"))
-        assert backend.get_custom_voice_names() == []
 
 
 # ---------------------------------------------------------------------------

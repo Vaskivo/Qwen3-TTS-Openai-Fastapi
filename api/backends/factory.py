@@ -15,24 +15,8 @@ from .base import TTSBackend
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
-_DEFAULT_CPU_MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 _backend_instance: Optional[TTSBackend] = None
 _initialization_lock: Optional[asyncio.Lock] = None
-
-
-def _env_int(name: str, default: int, minimum: int = 1) -> int:
-    raw = os.getenv(name)
-    if raw is None or not raw.strip():
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        logger.warning("Invalid %s=%r; using %d", name, raw, default)
-        return default
-    if value < minimum:
-        logger.warning("%s must be >= %d; using %d", name, minimum, default)
-        return default
-    return value
 
 
 def _env_float(name: str, default: float, minimum: float = 0.001) -> float:
@@ -67,20 +51,10 @@ def get_backend() -> TTSBackend:
     configured_model = os.getenv("TTS_MODEL_NAME") or os.getenv("TTS_MODEL_ID")
     model_name = (configured_model or _DEFAULT_MODEL).strip()
 
-    device = os.getenv("TTS_DEVICE", "auto").strip() or "auto"
-    dtype = os.getenv("TTS_DTYPE", "auto").strip() or "auto"
-    attn = os.getenv("TTS_ATTN", "auto").strip() or "auto"
-    cpu_threads = _env_int("CPU_THREADS", 12)
-    cpu_interop = _env_int("CPU_INTEROP", 2)
-    use_ipex = os.getenv("USE_IPEX", "false").strip().lower() == "true"
-    ov_device = os.getenv("OV_DEVICE", "CPU").strip() or "CPU"
-    ov_cache_dir = os.getenv("OV_CACHE_DIR", "./.ov_cache")
-    ov_model_dir = os.getenv("OV_MODEL_DIR", "./.ov_models")
-
     logger.info("Creating TTS backend: %s", backend_type)
 
-    # Imports are deliberately local. Optional backends must not make the
-    # default installation fail merely because their dependencies are absent.
+    # Imports are deliberately local so optional dependencies are not required
+    # merely to import the factory module.
     if backend_type == "optimized":
         from .optimized_backend import OptimizedQwen3TTSBackend
 
@@ -89,58 +63,10 @@ def get_backend() -> TTSBackend:
         from .official_qwen3_tts import OfficialQwen3TTSBackend
 
         _backend_instance = OfficialQwen3TTSBackend(model_name=model_name)
-    elif backend_type in {"vllm_omni", "vllm-omni", "vllm"}:
-        from .vllm_omni_qwen3_tts import VLLMOmniQwen3TTSBackend
-
-        _backend_instance = VLLMOmniQwen3TTSBackend(model_name=model_name)
-    elif backend_type == "pytorch":
-        from .pytorch_backend import PyTorchCPUBackend
-
-        device_val = device if device != "auto" else "cpu"
-        dtype_val = dtype if dtype != "auto" else "float32"
-        attn_val = attn if attn != "auto" else "sdpa"
-        cpu_model_name = (configured_model or _DEFAULT_CPU_MODEL).strip()
-        _backend_instance = PyTorchCPUBackend(
-            model_id=cpu_model_name,
-            device=device_val,
-            dtype=dtype_val,
-            attn_implementation=attn_val,
-            cpu_threads=cpu_threads,
-            cpu_interop_threads=cpu_interop,
-            use_ipex=use_ipex,
-        )
-        logger.info(
-            "PyTorch backend: device=%s dtype=%s attention=%s threads=%d interop=%d ipex=%s",
-            device_val,
-            dtype_val,
-            attn_val,
-            cpu_threads,
-            cpu_interop,
-            use_ipex,
-        )
-    elif backend_type == "openvino":
-        from .openvino_backend import OpenVINOBackend
-
-        _backend_instance = OpenVINOBackend(
-            ov_model_dir=ov_model_dir,
-            ov_device=ov_device,
-            ov_cache_dir=ov_cache_dir,
-        )
-        logger.warning(
-            "OpenVINO is experimental and requires a manually exported model; "
-            "use TTS_BACKEND=pytorch for the reliable CPU path."
-        )
-    elif backend_type == "mlx":
-        from .mlx_qwen3_tts import DEFAULT_MLX_MODEL, MLXQwen3TTSBackend
-
-        mlx_model_name = os.getenv("MLX_MODEL_ID", DEFAULT_MLX_MODEL).strip()
-        _backend_instance = MLXQwen3TTSBackend(
-            model_name=mlx_model_name or DEFAULT_MLX_MODEL
-        )
     else:
         raise ValueError(
             f"Unknown TTS_BACKEND: {backend_type!r}. Supported values: "
-            "optimized, official, vllm_omni, pytorch, openvino, mlx"
+            "optimized, official"
         )
 
     logger.info(

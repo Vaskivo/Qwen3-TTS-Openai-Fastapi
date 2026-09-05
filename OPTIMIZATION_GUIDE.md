@@ -175,8 +175,7 @@ self.model.model = torch.compile(self.model.model, mode="default")
 1. **Dynamic Batching**: Process multiple requests together (~2x throughput)
 2. **CUDA Graphs**: Capture and replay execution graphs (~10-15% speedup)
 3. **INT8 Quantization**: Reduce model size and speed up inference (~30-40% speedup)
-4. **vLLM Integration**: Advanced KV cache management and paged attention
-5. **Tensor Parallelism**: Multi-GPU inference for larger models
+4. **Tensor Parallelism**: Multi-GPU inference for larger models
 
 ### Experimental
 1. **torch.compile(fullgraph=True)**: Maximum optimization, less compatible
@@ -205,7 +204,7 @@ python bench_tts.py --label "Baseline"
 
 - **2026-01-25**: Added torch.compile(), TF32, and cuDNN benchmark optimizations
 - **2026-01-25**: Implemented Flash Attention 2 support
-- **2026-01-24**: Initial optimized deployment with vLLM-Omni backend
+- **2026-01-24**: Initial optimized deployment
 
 ---
 

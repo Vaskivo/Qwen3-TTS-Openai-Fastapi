@@ -53,10 +53,9 @@ _generation_semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
 # --- Auto-chunking -----------------------------------------------------------
 # Input is split at punctuation into chunks sized to a [min, max] character
 # window, each synthesized separately and the audio concatenated back together.
-# This keeps every generation well under the backend's wall-clock cap (and below
-# the mlx-audio 0.3.x graph-compile hang threshold for long sequences), and
-# lowers first-audio latency. Inputs that fit in a single chunk take the
-# original code path with zero overhead.
+# This keeps every generation well under the backend's wall-clock cap for
+# long sequences, and lowers first-audio latency. Inputs that fit in a
+# single chunk take the original code path with zero overhead.
 #
 # Splitting prefers sentence punctuation (. ! ?), then clause punctuation
 # (, ; :), then word boundaries. Chunks are packed greedily up to max_chars and
@@ -311,10 +310,9 @@ async def get_tts_backend():
     Honors lazy-load: if the backend hasn't been initialized yet, the
     first caller pays the model-load + warmup cost in one shot. The
     warmup is gated by the ``TTS_WARMUP_ON_START`` env var (which the
-    factory re-reads on each call). This is critical for the MLX
-    backend — the cold graph compile can wedge mlx-audio 0.3.x, and
-    warmup absorbs that cost at first-load time instead of on the
-    user's first request.
+    factory re-reads on each call). Warmup absorbs the model-load and
+    compile cost at first-load time instead of on the user's first
+    request.
     """
     from ..backends import get_backend, initialize_backend
 

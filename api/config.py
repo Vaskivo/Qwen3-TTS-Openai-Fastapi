@@ -4,7 +4,7 @@
 Configuration module for TTS backend settings.
 
 This module centralizes all configuration options for the TTS API,
-including backend selection, device settings, CPU tuning, and OpenVINO options.
+including backend selection and device settings.
 """
 
 import os
@@ -16,11 +16,10 @@ import os
 TTS_BACKEND = os.getenv("TTS_BACKEND", "official")
 """
 TTS backend to use.
-Options: 'official', 'vllm', 'pytorch', 'openvino'
+Options: 'official', 'optimized'
 - 'official': Official Qwen3-TTS implementation (default, GPU/CPU auto-detect)
-- 'vllm': vLLM-Omni backend for optimized inference
-- 'pytorch': CPU-optimized PyTorch backend
-- 'openvino': Experimental OpenVINO backend for Intel CPUs/NPUs
+- 'optimized': GPU production backend with model switching, native PCM
+  streaming, and the voice library
 """
 
 TTS_MODEL_ID = os.getenv("TTS_MODEL_ID", os.getenv("TTS_MODEL_NAME", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"))
@@ -66,54 +65,6 @@ Options: 'auto', 'flash_attention_2', 'sdpa', 'eager'
 """
 
 # ============================================================================
-# CPU Performance Tuning
-# ============================================================================
-
-CPU_THREADS = int(os.getenv("CPU_THREADS", str(os.cpu_count() or 4)))
-"""
-Number of threads for PyTorch CPU operations.
-Recommended: Set to number of physical cores (not logical cores).
-Default: Auto-detect available cores, fallback to 4.
-For i5-1240P: 12 threads (4 P-cores + 8 E-cores)
-"""
-
-CPU_INTEROP = int(os.getenv("CPU_INTEROP", "2"))
-"""
-Number of threads for inter-op parallelism.
-Recommended: 1-2 for most cases.
-"""
-
-# Optional: Set OpenMP/MKL threads (applied at import time)
-if TTS_DEVICE == "cpu" or (TTS_DEVICE == "auto" and not os.getenv("CUDA_VISIBLE_DEVICES")):
-    os.environ.setdefault("OMP_NUM_THREADS", str(CPU_THREADS))
-    os.environ.setdefault("MKL_NUM_THREADS", str(CPU_THREADS))
-
-# ============================================================================
-# OpenVINO Settings (Experimental)
-# ============================================================================
-
-OV_DEVICE = os.getenv("OV_DEVICE", "CPU")
-"""
-OpenVINO device target.
-Options: 'CPU', 'GPU', 'AUTO'
-- 'CPU': Intel CPU (most compatible)
-- 'GPU': Intel GPU (Iris Xe, Arc, etc., if supported)
-- 'AUTO': Let OpenVINO choose the best device
-"""
-
-OV_CACHE_DIR = os.getenv("OV_CACHE_DIR", "./.ov_cache")
-"""
-Directory for OpenVINO compilation cache.
-Speeds up model loading on subsequent runs.
-"""
-
-OV_MODEL_DIR = os.getenv("OV_MODEL_DIR", "./.ov_models")
-"""
-Directory containing exported OpenVINO IR models.
-The model.xml and model.bin files should be in this directory.
-"""
-
-# ============================================================================
 # Warmup and Optimization Settings
 # ============================================================================
 
@@ -122,28 +73,3 @@ TTS_WARMUP_ON_START = os.getenv("TTS_WARMUP_ON_START", "false").lower() == "true
 Whether to run a warmup inference on server startup.
 Recommended: true for production to initialize torch.compile() and cuDNN.
 """
-
-# ============================================================================
-# Intel Extension for PyTorch (IPEX) - Optional
-# ============================================================================
-
-USE_IPEX = os.getenv("USE_IPEX", "false").lower() == "true"
-"""
-Whether to use Intel Extension for PyTorch (IPEX).
-Only applicable for CPU inference on Intel processors.
-Requires: pip install intel-extension-for-pytorch
-"""
-
-if USE_IPEX and TTS_DEVICE in ("cpu", "auto"):
-    try:
-        import intel_extension_for_pytorch as ipex
-        IPEX_AVAILABLE = True
-    except ImportError:
-        IPEX_AVAILABLE = False
-        import logging
-        logging.getLogger(__name__).warning(
-            "USE_IPEX=true but intel-extension-for-pytorch is not installed. "
-            "Install with: pip install intel-extension-for-pytorch"
-        )
-else:
-    IPEX_AVAILABLE = False

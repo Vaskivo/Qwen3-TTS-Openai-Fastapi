@@ -6,7 +6,7 @@ Load your own cloned voices at server startup. Each voice is a folder inside `cu
 
 ## Requirements
 
-- **Official backend only** (`TTS_BACKEND=official`). vLLM does not support custom voices.
+- **Official backend only** (`TTS_BACKEND=official`).
 - **Base model** (`Qwen/Qwen3-TTS-12Hz-1.7B-Base` or the 0.6B equivalent). The default CustomVoice model will skip loading.
 
 ## Directory layout

@@ -95,8 +95,8 @@ async def test_backend_initializes_only_once_under_concurrency(monkeypatch):
     assert dummy.load_voice_calls == 1
 
 
-def test_invalid_integer_environment_falls_back(monkeypatch):
+def test_invalid_float_environment_falls_back(monkeypatch):
     from api.backends import factory
 
-    monkeypatch.setenv("CPU_THREADS", "not-a-number")
-    assert factory._env_int("CPU_THREADS", 12) == 12
+    monkeypatch.setenv("TTS_WARMUP_MAX_SECONDS", "not-a-number")
+    assert factory._env_float("TTS_WARMUP_MAX_SECONDS", 10.0) == 10.0
