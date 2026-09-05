@@ -132,6 +132,87 @@ def convert_to_pcm(audio: np.ndarray, bits_per_sample: int = 16) -> bytes:
     return _to_pcm_array(prepared, bits_per_sample).tobytes(order="C")
 
 
+# Streaming sizes are unknown up-front; use the canonical "unknown"
+# placeholder (0xFFFFFFFF) so the resulting stream is still a valid,
+# self-consistent WAV container that players can handle.
+_WAV_UNKNOWN_SIZE = 0xFFFFFFFF
+
+
+def wav_header_bytes(
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+    bits_per_sample: int = 16,
+    num_channels: int = 1,
+    data_size: Optional[int] = None,
+) -> bytes:
+    """Return a 44-byte PCM WAV header for streaming.
+
+    When *data_size* is ``None`` the size field is written as ``0xFFFFFFFF``
+    (the standard "unknown length" sentinel), producing a header that can be
+    emitted once before a continuous stream of PCM bytes. This avoids the
+    invalid pattern of writing a separate WAV header in front of every chunk.
+    """
+    if sample_rate <= 0:
+        raise ValueError("sample_rate must be greater than zero")
+    if num_channels < 1:
+        raise ValueError("num_channels must be at least 1")
+    bytes_per_sample = bits_per_sample // 8
+    block_align = num_channels * bytes_per_sample
+    byte_rate = sample_rate * block_align
+    if data_size is None:
+        # RIFF chunk size and data size both use the "unknown length" sentinel.
+        riff_size = _WAV_UNKNOWN_SIZE
+        data_field = _WAV_UNKNOWN_SIZE
+    else:
+        riff_size = 36 + data_size
+        data_field = data_size
+
+    buffer = io.BytesIO()
+    buffer.write(b"RIFF")
+    buffer.write(struct.pack("<I", riff_size))
+    buffer.write(b"WAVE")
+    buffer.write(b"fmt ")
+    buffer.write(struct.pack("<I", 16))
+    buffer.write(struct.pack("<H", 1))  # PCM
+    buffer.write(struct.pack("<H", num_channels))
+    buffer.write(struct.pack("<I", sample_rate))
+    buffer.write(struct.pack("<I", byte_rate))
+    buffer.write(struct.pack("<H", block_align))
+    buffer.write(struct.pack("<H", bits_per_sample))
+    buffer.write(b"data")
+    buffer.write(struct.pack("<I", data_field))
+    return buffer.getvalue()
+
+
+def pcm_bytes_from_chunk(
+    audio: np.ndarray, bits_per_sample: int = 16
+) -> bytes:
+    """Encode a single float PCM chunk to headerless integer PCM bytes.
+
+    Thin wrapper over :func:`convert_to_pcm` used by the streaming path so the
+    per-chunk call site reads clearly. Identical normalization/clipping to the
+    non-streaming path, so chunked PCM and one-shot PCM match byte-for-byte
+    (modulo the inter-chunk boundary).
+    """
+    return convert_to_pcm(audio, bits_per_sample)
+
+
+def iter_encoded_bytes(
+    data: bytes,
+    chunk_size: int = 4096,
+):
+    """Yield fixed-size byte slices from a single encoded payload.
+
+    Used for compressed ``stream_format="audio"`` responses: the model's PCM
+    stream is drained, encoded **once** into a single container, then split
+    over the HTTP response. Concatenating the slices reproduces the container
+    exactly.
+    """
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be >= 1")
+    for offset in range(0, len(data), chunk_size):
+        yield data[offset:offset + chunk_size]
+
+
 def encode_audio(
     audio: np.ndarray,
     format: AudioFormat = "mp3",

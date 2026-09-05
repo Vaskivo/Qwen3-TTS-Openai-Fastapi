@@ -155,9 +155,15 @@ response.stream_to_file("hola.wav")
 
 Encoding errors fail clearly. The server does **not** return WAV bytes while claiming a compressed content type.
 
-## Real-time PCM streaming
+## Streaming
 
-The optimized backend can yield PCM while the model is generating. Use `stream=true` and `response_format="pcm"`.
+Streaming is controlled by the OpenAI `stream_format` request field (not a boolean `stream` flag):
+
+- Omit `stream_format` to receive the complete audio in a single response.
+- `stream_format: "audio"` streams raw audio bytes over HTTP chunked transfer. `pcm` and `wav` are yielded **incrementally** as the optimized backend decodes (low latency). Compressed formats (mp3/opus/aac/flac) cannot be produced incrementally, so the model stream is drained, encoded once into a single container, and then byte-chunked — the client still receives one valid container, but without time-to-first-byte savings.
+- `stream_format: "sse"` streams OpenAI `speech.audio.*` Server-Sent Events: `speech.audio.delta` (base64 audio per event) and a terminal `speech.audio.done` (with a `usage` object). This is the format OpenAI SDK / SSE-only clients expect.
+
+Streaming requires `speed` to be `1.0` (or omitted). This Qwen3-TTS implementation applies speed adjustment to the fully-generated audio (via `librosa`) and cannot change speed while streaming; a request with `stream_format` set and `speed != 1.0` fails with HTTP 400 (`streaming_speed_unsupported`).
 
 ```python
 import httpx
@@ -169,7 +175,7 @@ request = {
     "voice": "Ryan",
     "input": "This audio is streamed as signed sixteen-bit PCM.",
     "response_format": "pcm",
-    "stream": True,
+    "stream_format": "audio",
 }
 
 with httpx.stream(
@@ -185,7 +191,34 @@ sd.play(pcm, samplerate=24000)
 sd.wait()
 ```
 
-For backends without native generation streaming, `stream=true` sends chunks from the completely encoded result. Compressed output is encoded once and then byte-chunked; separate compressed files are never concatenated.
+SSE example:
+
+```bash
+curl -N -X POST http://localhost:8880/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "tts-1",
+    "voice": "Vivian",
+    "input": "Streaming as Server-Sent Events.",
+    "response_format": "pcm",
+    "stream_format": "sse"
+  }'
+```
+
+## Voice style instructions
+
+Use the OpenAI `instructions` field for voice style/emotion control (forwarded to the model's `instruct` parameter). The older `instruct` request field is no longer accepted — use `instructions`.
+
+```python
+response = client.audio.speech.create(
+    model="tts-1",
+    voice="Vivian",
+    input="I am so excited!",
+    instructions="Speak with great enthusiasm.",
+    response_format="mp3",
+)
+response.stream_to_file("excited.mp3")
+```
 
 ## Backend selection
 

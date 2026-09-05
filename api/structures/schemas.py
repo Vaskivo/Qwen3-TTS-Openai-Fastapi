@@ -65,19 +65,32 @@ class OpenAISpeechRequest(BaseModel):
         default=1.0,
         ge=0.25,
         le=4.0,
-        description="The speed of the generated audio. Select a value from 0.25 to 4.0.",
+        description=(
+            "The speed of the generated audio. Select a value from 0.25 to 4.0. "
+            "A value other than 1.0 is only supported for non-streaming requests; "
+            "streaming requests (stream_format set) require speed=1.0."
+        ),
     )
-    stream: bool = Field(
-        default=False,
-        description="If true, audio will be streamed as it's generated.",
+    stream_format: Optional[Literal["sse", "audio"]] = Field(
+        default=None,
+        description=(
+            "The format to stream the audio in. Supported formats are `sse` and "
+            "`audio`. When omitted, the complete audio is returned in a single "
+            "response. `audio` streams raw audio bytes (HTTP chunked); `sse` "
+            "streams OpenAI `speech.audio.*` Server-Sent Events."
+        ),
     )
     language: Optional[str] = Field(
         default="Auto",
         description="Optional language code for TTS. If not provided, will auto-detect.",
     )
-    instruct: Optional[str] = Field(
+    instructions: Optional[str] = Field(
         default=None,
-        description="Optional instruction for voice style/emotion control.",
+        description=(
+            "Optional instructions for voice style/emotion control. Forwarded "
+            "to the backend's `instruct` parameter."
+        ),
+        max_length=4096,
     )
     normalization_options: Optional[NormalizationOptions] = Field(
         default_factory=NormalizationOptions,
