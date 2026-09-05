@@ -109,13 +109,16 @@ class Qwen3TTSModel:
         AutoModel.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
         AutoProcessor.register(Qwen3TTSConfig, Qwen3TTSProcessor)
 
+        # Local-only: never download or touch the HuggingFace cache. The caller
+        # is expected to pass a local directory (resolved via TTS_MODELS_DIR).
+        kwargs.setdefault("local_files_only", True)
         model = AutoModel.from_pretrained(pretrained_model_name_or_path, **kwargs)
         if not isinstance(model, Qwen3TTSForConditionalGeneration):
             raise TypeError(
                 f"AutoModel returned {type(model)}, expected Qwen3TTSForConditionalGeneration. "
             )
 
-        processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, fix_mistral_regex=True,)
+        processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, fix_mistral_regex=True, local_files_only=True)
 
         generate_defaults = model.generate_config
         return cls(model=model, processor=processor, generate_defaults=generate_defaults)

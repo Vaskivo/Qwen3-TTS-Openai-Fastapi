@@ -21,10 +21,15 @@ services:
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       VOICE_LIBRARY_DIR: /VOICES
       TORCHINDUCTOR_COMPILE_THREADS: 1
+      # Folder holding local model snapshots (one subdir per model, repo name
+      # without the org prefix, e.g. /MODELS/Qwen3-TTS-12Hz-1.7B-Base). Required:
+      # this build loads models only from local paths — it does not use the
+      # HuggingFace cache and never downloads.
+      TTS_MODELS_DIR: /MODELS
     volumes:
-      - "${HF_CACHE_DIR:-~/.cache/huggingface}:/home/appuser/.cache/huggingface"
       - ./VOICES:/VOICES
       - ./config.yaml:/home/appuser/qwen3-tts/config.yaml
+      - /mnt/CODE/AI_MODELS/TTS:/MODELS/
     deploy:
       resources:
         reservations:

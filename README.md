@@ -248,7 +248,9 @@ cp config.yaml ~/qwen3-tts/config.yaml
 TTS_BACKEND=optimized python -m api.main
 ```
 
-Edit the model entries in `config.yaml` to use Hugging Face IDs or local paths. The configured `type` must match the checkpoint: `customvoice` or `base`.
+Edit the model entries in `config.yaml` to use local paths or Hugging Face IDs. The configured `type` must match the checkpoint: `customvoice`, `base`, or `voice_design`. Models are loaded **only from local directories** — this build does not use the Hugging Face cache and never downloads. Set `TTS_MODELS_DIR` to a folder containing one subdir per model named after the HF repo without the org prefix (e.g. `Qwen/Qwen3-TTS-12Hz-1.7B-Base` → `/MODELS/Qwen3-TTS-12Hz-1.7B-Base`). The app resolves each `hf_id` to `<TTS_MODELS_DIR>/<repo-name-without-org>` and raises if it isn't present locally. `verify_models.py` at the repo root compares a `TTS_MODELS_DIR` folder against a Hugging Face cache (size + SHA-256, driven by `config.yaml`'s `models` section) — useful when migrating from a cache to the local folder.
+
+`config.yaml` also accepts an optional `voice_design_model` key naming a `voice_design`-type model. The optimized backend has no `generate_voice_design` API path, so VoiceDesign is run via the **official** backend (`TTS_BACKEND=official` + `TTS_MODEL_NAME=Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`) or `qwen_tts` directly; the key just makes the model discoverable in one shared config.
 
 ## Voice cloning
 
@@ -376,6 +378,7 @@ Review device mappings in `docker-compose.rocm.yml`; render-node names vary betw
 | `VOICE_LIBRARY_DIR` | `./voice_library` | Saved profile root |
 | `TTS_CUSTOM_VOICES` | `./custom_voices` | Legacy/custom voice directory |
 | `TTS_CONFIG` | `~/qwen3-tts/config.yaml` | Optimized-backend YAML |
+| `TTS_MODELS_DIR` | *(required)* | Folder of local model snapshots (one subdir per model, repo name without org prefix); models are loaded only from here — no HF cache, no downloads |
 | `GPU_KEEPALIVE_INTERVAL` | `0` | Optional GPU keepalive interval in seconds |
 | `TTS_AUTOCHUNK` | `true` | Enable punctuation-aware input splitting |
 | `TTS_MIN_CHUNK_CHARS` | `20` | Soft minimum chunk length |

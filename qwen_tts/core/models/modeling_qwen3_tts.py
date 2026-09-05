@@ -19,10 +19,8 @@ import os
 from dataclasses import dataclass
 from typing import Callable, Optional, Generator
 
-import huggingface_hub
 import numpy as np
 import torch
-from huggingface_hub import snapshot_download
 from librosa.filters import mel as librosa_mel_fn
 from torch import nn
 from torch.nn import functional as F
@@ -123,46 +121,6 @@ def _add_ref_code_context(
         return torch.cat([ref_prefix, window_codes], dim=0), ref_prefix_frames
 
     return window_codes, 0
-
-
-def download_weights_from_hf_specific(
-    model_name_or_path: str,
-    cache_dir: str | None,
-    allow_patterns: list[str],
-    revision: str | None = None,
-    ignore_patterns: str | list[str] | None = None,
-) -> str:
-    """Download model weights from Hugging Face Hub. Users can specify the
-    allow_patterns to download only the necessary weights.
-
-    Args:
-        model_name_or_path (str): The model name or path.
-        cache_dir (Optional[str]): The cache directory to store the model
-            weights. If None, will use HF defaults.
-        allow_patterns (list[str]): The allowed patterns for the
-            weight files. Files matched by any of the patterns will be
-            downloaded.
-        revision (Optional[str]): The revision of the model.
-        ignore_patterns (Optional[Union[str, list[str]]]): The patterns to
-            filter out the weight files. Files matched by any of the patterns
-            will be ignored.
-
-    Returns:
-        str: The path to the downloaded model weights.
-    """
-    assert len(allow_patterns) > 0
-    local_only = huggingface_hub.constants.HF_HUB_OFFLINE
-
-    for allow_pattern in allow_patterns:
-        hf_folder = snapshot_download(
-            model_name_or_path,
-            allow_patterns=allow_pattern,
-            ignore_patterns=ignore_patterns,
-            cache_dir=cache_dir,
-            revision=revision,
-            local_files_only=local_only,
-        )
-    return hf_folder
 
 
 class Res2NetBlock(torch.nn.Module):
@@ -2143,43 +2101,39 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         weights_only=True,
         **kwargs,
     ):
+        # This build loads models only from local directories — it does not use
+        # the HuggingFace cache and never downloads. Require a local path and
+        # force local_files_only=True so transformers never hits the network.
+        if not os.path.isdir(pretrained_model_name_or_path):
+            raise ValueError(
+                f"from_pretrained requires an existing local model directory, "
+                f"got {pretrained_model_name_or_path!r}. Provide a local path "
+                f"(e.g. via TTS_MODELS_DIR resolution)."
+            )
         model = super().from_pretrained(
             pretrained_model_name_or_path,
             *model_args,
             config=config,
             cache_dir=cache_dir,
             ignore_mismatched_sizes=ignore_mismatched_sizes,
-            force_download=force_download,
-            local_files_only=local_files_only,
-            token=token,
+            force_download=False,
+            local_files_only=True,
+            token=None,
             revision=revision,
             use_safetensors=use_safetensors,
             weights_only=weights_only,
             **kwargs,
         )
-        if not local_files_only and not os.path.isdir(pretrained_model_name_or_path):
-            download_cache_dir = kwargs.get("cache_dir", cache_dir)
-            download_revision = kwargs.get("revision", revision)
-            download_weights_from_hf_specific(
-                pretrained_model_name_or_path,
-                cache_dir=download_cache_dir,
-                allow_patterns=["speech_tokenizer/*"],
-                revision=download_revision,
-            )
         speech_tokenizer_path = cached_file(
             pretrained_model_name_or_path,
             "speech_tokenizer/config.json",
             subfolder=kwargs.pop("subfolder", None),
-            cache_dir=kwargs.pop("cache_dir", None),
-            force_download=kwargs.pop("force_download", False),
-            proxies=kwargs.pop("proxies", None),
-            resume_download=kwargs.pop("resume_download", None),
-            local_files_only=kwargs.pop("local_files_only", False),
-            token=kwargs.pop("use_auth_token", None),
-            revision=kwargs.pop("revision", None),
+            cache_dir=None,
+            force_download=False,
+            local_files_only=True,
         )
         if speech_tokenizer_path is None:
-            raise ValueError(f"""{pretrained_model_name_or_path}/{speech_tokenizer_path} not exists""")
+            raise ValueError(f"""{pretrained_model_name_or_path}/speech_tokenizer/config.json not exists""")
         speech_tokenizer_dir = os.path.dirname(speech_tokenizer_path)
         speech_tokenizer = Qwen3TTSTokenizer.from_pretrained(
             speech_tokenizer_dir,
@@ -2192,13 +2146,9 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             pretrained_model_name_or_path,
             "generation_config.json",
             subfolder=kwargs.pop("subfolder", None),
-            cache_dir=kwargs.pop("cache_dir", None),
-            force_download=kwargs.pop("force_download", False),
-            proxies=kwargs.pop("proxies", None),
-            resume_download=kwargs.pop("resume_download", None),
-            local_files_only=kwargs.pop("local_files_only", False),
-            token=kwargs.pop("use_auth_token", None),
-            revision=kwargs.pop("revision", None),
+            cache_dir=None,
+            force_download=False,
+            local_files_only=True,
         )
         with open(generate_config_path, "r", encoding="utf-8") as f:
             generate_config = json.load(f)

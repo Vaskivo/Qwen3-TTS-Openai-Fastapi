@@ -84,7 +84,9 @@ class Qwen3TTSTokenizer:
         AutoConfig.register("qwen3_tts_tokenizer_12hz", Qwen3TTSTokenizerV2Config)
         AutoModel.register(Qwen3TTSTokenizerV2Config, Qwen3TTSTokenizerV2Model)
 
-        inst.feature_extractor = AutoFeatureExtractor.from_pretrained(pretrained_model_name_or_path)
+        # Local-only: never download or touch the HuggingFace cache.
+        inst.feature_extractor = AutoFeatureExtractor.from_pretrained(pretrained_model_name_or_path, local_files_only=True)
+        kwargs.setdefault("local_files_only", True)
         inst.model = AutoModel.from_pretrained(pretrained_model_name_or_path, **kwargs)
         inst.config = inst.model.config
 

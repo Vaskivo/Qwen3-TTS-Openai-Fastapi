@@ -13,11 +13,12 @@ services:
       - TTS_BACKEND=optimized
       - TTS_CONFIG=/root/qwen3-tts/config.yaml
       - VOICE_LIBRARY_DIR=/root/qwen3-tts/voice_library
+      - TTS_MODELS_DIR=/MODELS
       - GPU_KEEPALIVE_INTERVAL=15
     volumes:
       - ./config.yaml:/root/qwen3-tts/config.yaml:ro
       - ./voice_library:/root/qwen3-tts/voice_library
-      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+      - ${TTS_MODELS_HOST_DIR:-/mnt/CODE/AI_MODELS/TTS}:/MODELS:ro
     devices:
       - /dev/kfd:/dev/kfd
       # Adjust renderD128 if your AMD GPU exposes a different render node.

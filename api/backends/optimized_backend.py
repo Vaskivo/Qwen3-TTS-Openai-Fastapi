@@ -25,6 +25,7 @@ from typing import AsyncGenerator, Dict, List, Optional, Tuple, Any
 import numpy as np
 
 from .base import TTSBackend
+from .factory import resolve_model_path
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +188,30 @@ class OptimizedQwen3TTSBackend(TTSBackend):
                 f"got {type(load_both).__name__}."
             )
 
+        # Optional: a VoiceDesign model (type: voice_design). The optimized
+        # backend has no generate_voice_design path today, so this key only
+        # makes the model discoverable/configurable here; it stays runnable
+        # via the official backend + qwen_tts directly. Validate only when set.
+        design_key = self.config.get("voice_design_model")
+        if design_key is not None:
+            if not design_key:
+                raise ValueError(
+                    "config.yaml: `voice_design_model` is present but empty "
+                    "(remove it or name a `voice_design`-type key in `models`)."
+                )
+            if design_key not in models:
+                raise ValueError(
+                    f"config.yaml: `voice_design_model: {design_key!r}` is not a "
+                    f"key in `models`. Available: {list(models.keys())}."
+                )
+            if not isinstance(models[design_key], dict) \
+                    or models[design_key].get("type") != "voice_design":
+                raise ValueError(
+                    f"config.yaml: `voice_design_model: {design_key!r}` is not "
+                    f"a `voice_design`-type model. "
+                    f"Set its `type: voice_design` or remove the key."
+                )
+
     def _default_model_key(self) -> str:
         return self.config["default_model"]
 
@@ -194,11 +219,69 @@ class OptimizedQwen3TTSBackend(TTSBackend):
         """Return the Base model key used for voice cloning."""
         return self.config["voice_clone_model"]
 
+    def _voice_design_model_key(self) -> Optional[str]:
+        """Return the optional VoiceDesign model key, or None if unset.
+
+        The optimized backend has no generate_voice_design path; this is only
+        for discoverability/config. Run VoiceDesign via the official backend.
+        """
+        return self.config.get("voice_design_model")
+
     def _load_both_models(self) -> bool:
         return bool(self.config.get("load_both_models", False))
 
     def _model_info(self, model_key: str) -> dict:
         return self.config.get("models", {}).get(model_key, {})
+
+    @staticmethod
+    def _unload_model_instance(model: Any) -> None:
+        """Actually release a loaded model's VRAM.
+
+        ``del`` + ``torch.cuda.empty_cache()`` alone is NOT enough: nn.Module
+        trees hold reference cycles (parent↔child via ``_modules``, hooks), so
+        refcount-only deletion often leaves tensors live, and ``empty_cache()``
+        only returns the allocator's *free* pool — it never frees tensors that
+        are still referenced. The result is that "unloaded" models stay resident
+        in VRAM (both models visible after a swap).
+
+        To actually free the memory we drop the reference and force a
+        garbage-collection pass to break the cycles (which lets the GPU
+        tensors be released), then return the now-truly-free blocks to the
+        allocator with ``empty_cache()``. No CPU copy is needed — we don't
+        want to *move* the weights, only stop referencing them.
+        """
+        import gc
+        import torch
+
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _unload_resident_models(self) -> None:
+        """Unload all resident models (swap mode: keep at most one).
+
+        Voice-prompt cache entries are tied to a specific base-model instance,
+        so clear them on unload (today's behaviour). Also clears the active
+        ``self.model`` pointer if it points at a model being unloaded.
+        """
+        if not self._models:
+            return
+        if self._voice_prompt_cache:
+            logger.info(
+                f"Clearing voice prompt cache "
+                f"({len(self._voice_prompt_cache)} entries)"
+            )
+            self._voice_prompt_cache.clear()
+        for old_key in list(self._models.keys()):
+            logger.info(f"Unloading {old_key!r}…")
+            instance = self._models[old_key]
+            if self.model is instance:
+                self.model = None
+            self._unload_model_instance(instance)
+            del self._models[old_key]
+        self.current_model_key = None
+        self._ready = False
 
     async def _ensure_model_loaded(self, model_key: str) -> None:
         """Ensure *model_key* is resident and make it the active model.
@@ -225,23 +308,20 @@ class OptimizedQwen3TTSBackend(TTSBackend):
             )
 
         hf_id = model_info["hf_id"]
+        load_path = resolve_model_path(hf_id)
+        if load_path != hf_id:
+            logger.info(
+                f"Resolved model {model_key!r} via TTS_MODELS_DIR: "
+                f"{hf_id} -> {load_path}"
+            )
 
         # Unload any resident models when not keeping both.  Voice-prompt
         # cache entries are tied to a specific base-model instance, so clear
         # them on unload (today's behaviour).
         if not self._load_both_models() and self._models:
-            for old_key in list(self._models.keys()):
-                logger.info(f"Unloading {old_key!r}…")
-                if self._voice_prompt_cache:
-                    logger.info(
-                        f"Clearing voice prompt cache "
-                        f"({len(self._voice_prompt_cache)} entries)"
-                    )
-                    self._voice_prompt_cache.clear()
-                del self._models[old_key]
-                torch.cuda.empty_cache()
+            self._unload_resident_models()
 
-        logger.info(f"Loading {model_key!r} ({hf_id})…")
+        logger.info(f"Loading {model_key!r} ({load_path})…")
 
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
         self.dtype = torch.bfloat16 if self.device != "cpu" else torch.float32
@@ -254,7 +334,7 @@ class OptimizedQwen3TTSBackend(TTSBackend):
 
         try:
             loaded = Qwen3TTSModel.from_pretrained(
-                hf_id,
+                load_path,
                 device_map=self.device,
                 dtype=self.dtype,
                 attn_implementation=attn_impl,
@@ -263,7 +343,7 @@ class OptimizedQwen3TTSBackend(TTSBackend):
         except Exception as exc:
             logger.warning(f"Failed with {attn_impl}: {exc}; retrying with sdpa")
             loaded = Qwen3TTSModel.from_pretrained(
-                hf_id,
+                load_path,
                 device_map=self.device,
                 dtype=self.dtype,
                 attn_implementation="sdpa",

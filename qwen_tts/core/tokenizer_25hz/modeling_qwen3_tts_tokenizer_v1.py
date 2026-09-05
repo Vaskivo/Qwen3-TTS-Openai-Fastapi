@@ -15,6 +15,7 @@
 """PyTorch Qwen3TTSTokenizerV1 model."""
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional, Union, List
 
@@ -1409,15 +1410,21 @@ class Qwen3TTSTokenizerV1Model(Qwen3TTSTokenizerV1PreTrainedModel):
         weights_only=True,
         **kwargs,
     ):
+        # Local-only: never download. Require an existing local directory.
+        if not os.path.isdir(pretrained_model_name_or_path):
+            raise ValueError(
+                f"from_pretrained requires an existing local model directory, "
+                f"got {pretrained_model_name_or_path!r}."
+            )
         model = super().from_pretrained(
             pretrained_model_name_or_path,
             *model_args,
             config=config,
             cache_dir=cache_dir,
             ignore_mismatched_sizes=ignore_mismatched_sizes,
-            force_download=force_download,
-            local_files_only=local_files_only,
-            token=token,
+            force_download=False,
+            local_files_only=True,
+            token=None,
             revision=revision,
             use_safetensors=use_safetensors,
             weights_only=weights_only,
@@ -1427,16 +1434,12 @@ class Qwen3TTSTokenizerV1Model(Qwen3TTSTokenizerV1PreTrainedModel):
             pretrained_model_name_or_path,
             "campplus.onnx",
             subfolder=kwargs.pop("subfolder", None),
-            cache_dir=kwargs.pop("cache_dir", None),
-            force_download=kwargs.pop("force_download", False),
-            proxies=kwargs.pop("proxies", None),
-            resume_download=kwargs.pop("resume_download", None),
-            local_files_only=kwargs.pop("local_files_only", False),
-            token=kwargs.pop("use_auth_token", None),
-            revision=kwargs.pop("revision", None),
+            cache_dir=None,
+            force_download=False,
+            local_files_only=True,
         )
         if encoder_xvector_extractor_path is None:
-            raise ValueError(f"""{pretrained_model_name_or_path}/{encoder_xvector_extractor_path} not exists""")
+            raise ValueError(f"""{pretrained_model_name_or_path}/campplus.onnx not exists""")
         model.load_encoder_xvector_extractor(encoder_xvector_extractor_path)
 
         return model

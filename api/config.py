@@ -24,7 +24,8 @@ Options: 'official', 'optimized'
 
 TTS_MODEL_ID = os.getenv("TTS_MODEL_ID", os.getenv("TTS_MODEL_NAME", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"))
 """
-Model identifier for HuggingFace.
+Model identifier (local path or HF repo id resolved against TTS_MODELS_DIR).
+Models are loaded only from local paths — no HuggingFace cache, no downloads.
 Examples: 
 - Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice (default, voice design)
 - Qwen/Qwen3-TTS-12Hz-1.7B-Base (voice cloning support)

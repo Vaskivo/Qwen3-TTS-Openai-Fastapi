@@ -9,12 +9,14 @@ from the qwen_tts package.
 
 import asyncio
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 import numpy as np
 
 from .base import TTSBackend
+from .factory import resolve_model_path
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,45 @@ class OfficialQwen3TTSBackend(TTSBackend):
         super().__init__()
         self.model_name = model_name
         self._ready = False
+        self._voice_design_model_id: Optional[str] = self._read_voice_design_model_id()
+
+    @staticmethod
+    def _read_voice_design_model_id() -> Optional[str]:
+        """Optionally read the `voice_design_model` key from the optimized
+        backend's config.yaml (TTS_CONFIG, default ~/qwen3-tts/config.yaml).
+
+        The official backend doesn't otherwise use config.yaml, but this lets a
+        deployment name the VoiceDesign model in one shared place. Returns the
+        model's `hf_id` if configured, else None. Errors are non-fatal.
+        """
+        config_path = Path(os.environ.get("TTS_CONFIG", str(Path.home() / "qwen3-tts" / "config.yaml")))
+        if not config_path.exists():
+            return None
+        try:
+            import yaml
+            with open(config_path) as fh:
+                cfg = yaml.safe_load(fh) or {}
+        except Exception as exc:
+            logger.warning(f"Could not read voice_design_model from {config_path}: {exc}")
+            return None
+        design_key = cfg.get("voice_design_model")
+        if not design_key:
+            return None
+        models = cfg.get("models", {}) or {}
+        info = models.get(design_key)
+        if isinstance(info, dict) and info.get("hf_id"):
+            return info["hf_id"]
+        return None
+
+    def get_voice_design_model_id(self) -> Optional[str]:
+        """Return the configured VoiceDesign model hf_id, or None if unset.
+
+        The official backend still loads whichever model `TTS_MODEL_NAME`/
+        `model_name` points at; this only exposes the configured VoiceDesign id
+        for discoverability. To run VoiceDesign, set
+        `TTS_MODEL_NAME` to this id (it loads via TTS_MODELS_DIR when set).
+        """
+        return self._voice_design_model_id
     
     async def initialize(self) -> None:
         """Initialize the backend and load the model."""
@@ -72,6 +113,16 @@ class OfficialQwen3TTSBackend(TTSBackend):
             
             logger.info(f"Loading Qwen3-TTS model '{self.model_name}' on {self.device}...")
 
+            # Resolve a local path under TTS_MODELS_DIR (if configured) before
+            # loading, so a deployment can ship models in /MODELS without the HF
+            # cache. Falls back to the HF repo id / cache otherwise.
+            load_path = resolve_model_path(self.model_name)
+            if load_path != self.model_name:
+                logger.info(
+                    f"Resolved model via TTS_MODELS_DIR: "
+                    f"{self.model_name} -> {load_path}"
+                )
+
             # Try loading with Flash Attention 2, fallback to SDPA or eager if not supported
             # (e.g., RTX 5090/Blackwell GPUs don't have pre-built flash-attn wheels yet)
             attn_implementations = ["flash_attention_2", "sdpa", "eager"]
@@ -82,7 +133,7 @@ class OfficialQwen3TTSBackend(TTSBackend):
                 try:
                     logger.info(f"Attempting to load model with attention: {attn_impl}")
                     self.model = Qwen3TTSModel.from_pretrained(
-                        self.model_name,
+                        load_path,
                         device_map=self.device,
                         dtype=self.dtype,
                         attn_implementation=attn_impl,
@@ -104,7 +155,7 @@ class OfficialQwen3TTSBackend(TTSBackend):
                     self.dtype = torch.float32
                     try:
                         self.model = Qwen3TTSModel.from_pretrained(
-                            self.model_name,
+                            load_path,
                             device_map=self.device,
                             dtype=self.dtype,
                             attn_implementation="eager",

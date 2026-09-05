@@ -12,6 +12,13 @@ default_model: 1.7B-CustomVoice
 # /v1/audio/voice-clone).  Must be a `base`-type model from `models` below.
 voice_clone_model: 1.7B-Base
 
+# Optional: VoiceDesign model for natural-language voice-style instructions.
+# The optimized backend has no generate_voice_design path today, so this key
+# only makes the model discoverable/configurable here; run it via the official
+# backend (TTS_BACKEND=official, TTS_MODEL_NAME=<the hf_id below>) or qwen_tts.
+# Must name a `voice_design`-type key in `models`.  Comment out to disable.
+voice_design_model: 1.7B-VoiceDesign
+
 # Whether to keep both `default_model` and `voice_clone_model` resident in
 # VRAM at the same time.
 #   true  — load both once (lazily on first use, or eagerly at startup when
@@ -21,10 +28,12 @@ voice_clone_model: 1.7B-Base
 load_both_models: false
 
 # Available models.  Each entry maps a short name to a HuggingFace repo id (or
-# a local path) and a model type ("customvoice" or "base").
+# a local path) and a model type.
 #
-# - customvoice  — predefined speakers (Vivian, Ryan, …); fastest for bulk TTS
-# - base         — required for voice cloning (clone: prefix) and voice library
+# - customvoice   — predefined speakers (Vivian, Ryan, …); fastest for bulk TTS
+# - base          — required for voice cloning (clone: prefix) and voice library
+# - voice_design  — voice-style instructions via generate_voice_design
+#                   (official backend / qwen_tts only; not in the optimized API)
 models:
   1.7B-Base:
     hf_id: Qwen/Qwen3-TTS-12Hz-1.7B-Base
@@ -32,6 +41,9 @@ models:
   1.7B-CustomVoice:
     hf_id: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
     type: customvoice
+  1.7B-VoiceDesign:
+    hf_id: Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign
+    type: voice_design
   0.6B-CustomVoice:
     hf_id: Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
     type: customvoice

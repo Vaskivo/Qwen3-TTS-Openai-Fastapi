@@ -411,6 +411,14 @@ class TestEnsureModelLoadedResidency:
         cfg.setdefault("optimization", {})["use_compile"] = False
         _write_config(tmp_path, monkeypatch, cfg)
 
+        # Models load only from local paths (no HF cache). Create the local
+        # model dirs so resolve_model_path() finds them: hf_id "test/cv" ->
+        # <models_dir>/cv, "test/base" -> <models_dir>/base.
+        models_dir = tmp_path / "models"
+        for info in cfg["models"].values():
+            (models_dir / info["hf_id"].split("/")[-1]).mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("TTS_MODELS_DIR", str(models_dir))
+
         from api.backends import optimized_backend
 
         def _fake_from_pretrained(hf_id, **kwargs):
@@ -437,11 +445,16 @@ class TestEnsureModelLoadedResidency:
         asyncio.run(backend._ensure_model_loaded("cv"))
         assert backend.get_loaded_model_keys() == ["cv"]
         assert backend.current_model_key == "cv"
+        cv_instance = backend.model
 
         asyncio.run(backend._ensure_model_loaded("base"))
         assert backend.get_loaded_model_keys() == ["base"]
         assert backend.current_model_key == "base"
         assert backend.is_ready()
+        # The swap must drop the old model: self.model now points at the new
+        # instance, and the old one is no longer resident.
+        assert backend.model is not cv_instance
+        assert backend.model is backend._models["base"]
 
     def test_both_keeps_resident_models(self, tmp_path, monkeypatch):
         backend = self._make_backend(tmp_path, monkeypatch, load_both=True)

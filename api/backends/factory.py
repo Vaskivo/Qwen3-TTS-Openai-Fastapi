@@ -41,6 +41,53 @@ def _get_initialization_lock() -> asyncio.Lock:
     return _initialization_lock
 
 
+def resolve_model_path(hf_id: str, models_dir: Optional[str] = None) -> str:
+    """Resolve a model identifier to a **local** model directory on disk.
+
+    This project loads models only from local paths — it does not use the
+    HuggingFace cache and never downloads. Resolution order:
+      1. If ``hf_id`` is an existing path on disk (absolute or relative to the
+         current working directory), return it unchanged.
+      2. Else if a models folder is configured (``models_dir`` argument, or the
+         ``TTS_MODELS_DIR`` env var), look for
+         ``<models_dir>/<repo-name-without-org>`` (i.e. strip any ``<org>/``
+         prefix, so ``Qwen/Qwen3-TTS-12Hz-1.7B-Base`` maps to
+         ``<models_dir>/Qwen3-TTS-12Hz-1.7B-Base``). If that directory exists,
+         return it.
+      3. Else raise ``FileNotFoundError`` — there is no HuggingFace fallback.
+
+    This is pure path/string logic with no backend dependencies, so it is safe
+    to share between the optimized and official backends.
+    """
+    if not hf_id:
+        return hf_id
+
+    # 1. Existing explicit path wins.
+    candidate = Path(hf_id)
+    if candidate.exists():
+        return str(candidate)
+
+    # 2. TTS_MODELS_DIR folder prefix.
+    folder = models_dir if models_dir is not None else os.getenv("TTS_MODELS_DIR")
+    if folder:
+        repo_name = hf_id.split("/")[-1]
+        local_dir = Path(folder) / repo_name
+        if local_dir.exists():
+            return str(local_dir)
+
+    # 3. No HuggingFace fallback — models must be present locally.
+    hint = (
+        f" Set TTS_MODELS_DIR to a folder containing '{hf_id.split('/')[-1]}' "
+        f"or point the config entry at an existing local path."
+        if "/" in hf_id or not Path(hf_id).exists()
+        else ""
+    )
+    raise FileNotFoundError(
+        f"Model not found locally: {hf_id!r}. This build does not use the "
+        f"HuggingFace cache or download models.{hint}"
+    )
+
+
 def get_backend() -> TTSBackend:
     """Return the process-wide backend instance, creating it lazily."""
     global _backend_instance
