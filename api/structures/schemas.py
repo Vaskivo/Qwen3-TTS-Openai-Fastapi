@@ -50,8 +50,8 @@ class OpenAISpeechRequest(BaseModel):
     )
     input: str = Field(
         ...,
-        description="The text to generate audio for. Maximum length is 4096 characters.",
-        max_length=4096,
+        description="The text to generate audio for. Maximum length is 16384 characters.",
+        max_length=16384,
     )
     voice: str = Field(
         default="Vivian",
