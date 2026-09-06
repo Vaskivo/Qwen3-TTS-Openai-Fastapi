@@ -41,7 +41,7 @@ cp ~/my_sample.wav custom_voices/Alice/reference.wav
 echo "This is Alice speaking clearly." > custom_voices/Alice/reference.txt
 
 # 4. Start the server with the Base model
-TTS_MODEL_NAME=Qwen/Qwen3-TTS-12Hz-1.7B-Base python -m api.main
+TTS_MODEL_ID=Qwen/Qwen3-TTS-12Hz-1.7B-Base python -m api.main
 ```
 
 The `TTS_CUSTOM_VOICES` env var overrides the default path:
@@ -57,7 +57,8 @@ Mount your `custom_voices/` directory into the container. In `docker-compose.yml
 ```yaml
 qwen3-tts-gpu:
   environment:
-    - TTS_MODEL_NAME=Qwen/Qwen3-TTS-12Hz-1.7B-Base
+    - TTS_MODEL_ID=Qwen/Qwen3-TTS-12Hz-1.7B-Base
+    # (TTS_MODEL_NAME is a legacy alias for TTS_MODEL_ID; either works)
   volumes:
     - ./custom_voices:/app/custom_voices          # <-- add this
 ```

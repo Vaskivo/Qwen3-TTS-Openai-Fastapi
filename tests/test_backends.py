@@ -58,12 +58,24 @@ class TestBackendSelection:
         assert "mlx" not in message
 
     def test_custom_model_name_via_env(self, monkeypatch):
-        """Test overriding model name via environment variable."""
+        """Test overriding model name via the legacy TTS_MODEL_NAME env var."""
         monkeypatch.setenv("TTS_BACKEND", "official")
+        # TTS_MODEL_ID takes precedence, so it must be unset for the legacy
+        # TTS_MODEL_NAME fallback to take effect.
+        monkeypatch.delenv("TTS_MODEL_ID", raising=False)
         monkeypatch.setenv("TTS_MODEL_NAME", "custom/model")
 
         backend = get_backend()
         assert backend.get_model_id() == "custom/model"
+
+    def test_model_id_takes_precedence_over_model_name(self, monkeypatch):
+        """TTS_MODEL_ID wins when both TTS_MODEL_ID and TTS_MODEL_NAME are set."""
+        monkeypatch.setenv("TTS_BACKEND", "official")
+        monkeypatch.setenv("TTS_MODEL_ID", "preferred/model")
+        monkeypatch.setenv("TTS_MODEL_NAME", "legacy/model")
+
+        backend = get_backend()
+        assert backend.get_model_id() == "preferred/model"
 
     def test_backend_singleton(self, monkeypatch):
         """Test that get_backend returns the same instance."""

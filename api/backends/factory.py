@@ -95,7 +95,7 @@ def get_backend() -> TTSBackend:
         return _backend_instance
 
     backend_type = os.getenv("TTS_BACKEND", "official").strip().lower()
-    configured_model = os.getenv("TTS_MODEL_NAME") or os.getenv("TTS_MODEL_ID")
+    configured_model = os.getenv("TTS_MODEL_ID") or os.getenv("TTS_MODEL_NAME")
     model_name = (configured_model or _DEFAULT_MODEL).strip()
 
     logger.info("Creating TTS backend: %s", backend_type)

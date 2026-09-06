@@ -233,7 +233,7 @@ Set `TTS_BACKEND` before starting the server.
 
 ```bash
 export TTS_BACKEND=official
-export TTS_MODEL_NAME=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+export TTS_MODEL_ID=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
 python -m api.main
 ```
 
@@ -250,7 +250,7 @@ TTS_BACKEND=optimized python -m api.main
 
 Edit the model entries in `config.yaml` to use local paths or Hugging Face IDs. The configured `type` must match the checkpoint: `customvoice`, `base`, or `voice_design`. Models are loaded **only from local directories** — this build does not use the Hugging Face cache and never downloads. Set `TTS_MODELS_DIR` to a folder containing one subdir per model named after the HF repo without the org prefix (e.g. `Qwen/Qwen3-TTS-12Hz-1.7B-Base` → `/MODELS/Qwen3-TTS-12Hz-1.7B-Base`). The app resolves each `hf_id` to `<TTS_MODELS_DIR>/<repo-name-without-org>` and raises if it isn't present locally. `verify_models.py` at the repo root compares a `TTS_MODELS_DIR` folder against a Hugging Face cache (size + SHA-256, driven by `config.yaml`'s `models` section) — useful when migrating from a cache to the local folder.
 
-`config.yaml` also accepts an optional `voice_design_model` key naming a `voice_design`-type model. The optimized backend has no `generate_voice_design` API path, so VoiceDesign is run via the **official** backend (`TTS_BACKEND=official` + `TTS_MODEL_NAME=Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`) or `qwen_tts` directly; the key just makes the model discoverable in one shared config.
+`config.yaml` also accepts an optional `voice_design_model` key naming a `voice_design`-type model. The optimized backend has no `generate_voice_design` API path, so VoiceDesign is run via the **official** backend (`TTS_BACKEND=official` + `TTS_MODEL_ID=Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`) or `qwen_tts` directly; the key just makes the model discoverable in one shared config.
 
 ## Voice cloning
 
@@ -258,7 +258,7 @@ Run a Base checkpoint:
 
 ```bash
 TTS_BACKEND=official \
-TTS_MODEL_NAME=Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+TTS_MODEL_ID=Qwen/Qwen3-TTS-12Hz-1.7B-Base \
 python -m api.main
 ```
 
@@ -345,7 +345,7 @@ Override the host port or model without editing Compose:
 
 ```bash
 TTS_PORT=9000 \
-TTS_MODEL_NAME=Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+TTS_MODEL_ID=Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
 docker compose up --build qwen3-tts-gpu
 ```
 
@@ -367,7 +367,7 @@ Review device mappings in `docker-compose.rocm.yml`; render-node names vary betw
 | `PORT` | `8880` | Listen port |
 | `WORKERS` | `1` | Uvicorn worker processes; each process loads its own model |
 | `TTS_BACKEND` | `official` | Backend selector |
-| `TTS_MODEL_NAME` / `TTS_MODEL_ID` | backend-specific | Hugging Face ID or local model path |
+| `TTS_MODEL_ID` / `TTS_MODEL_NAME` (legacy alias) | backend-specific | Hugging Face ID or local model path (`TTS_MODEL_ID` takes precedence) |
 | `TTS_LAZY_LOAD` | `true` | Load on first synthesis request |
 | `TTS_WARMUP_ON_START` | `false` | Warm regular and supported streaming paths |
 | `TTS_WARMUP_MAX_SECONDS` | `10` | Timeout per warmup request |
@@ -380,10 +380,11 @@ Review device mappings in `docker-compose.rocm.yml`; render-node names vary betw
 | `TTS_CONFIG` | `~/qwen3-tts/config.yaml` | Optimized-backend YAML |
 | `TTS_MODELS_DIR` | *(required)* | Folder of local model snapshots (one subdir per model, repo name without org prefix); models are loaded only from here — no HF cache, no downloads |
 | `GPU_KEEPALIVE_INTERVAL` | `0` | Optional GPU keepalive interval in seconds |
-| `TTS_AUTOCHUNK` | `true` | Enable punctuation-aware input splitting |
-| `TTS_MIN_CHUNK_CHARS` | `20` | Soft minimum chunk length |
-| `TTS_MAX_CHUNK_CHARS` | `70` | Target maximum chunk length |
-| `TTS_CHUNK_GAP_MS` | `120` | Silence inserted between generated chunks |
+| `TTS_AUTOCHUNK` | `true` | Enable punctuation-aware input splitting for **non-streaming** requests |
+| `TTS_STREAM_AUTOCHUNK` | `true` | Enable chunking for **streaming** requests (independent of `TTS_AUTOCHUNK`; bounds peak VRAM by giving each chunk its own short-lived KV cache) |
+| `TTS_MIN_CHUNK_CHARS` | `20` | Soft minimum chunk length (shared by both paths) |
+| `TTS_MAX_CHUNK_CHARS` | `70` | Target maximum chunk length (shared by both paths) |
+| `TTS_CHUNK_GAP_MS` | `120` | Silence inserted between generated chunks (shared by both paths) |
 
 Invalid float settings fall back to safe defaults instead of crashing module import.
 

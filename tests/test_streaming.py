@@ -302,3 +302,106 @@ class TestNonStreamingDefault:
         assert response.status_code == 200
         assert response.headers["content-type"] == "audio/wav"
         assert response.content.startswith(b"RIFF")
+
+
+class TestStreamingChunking:
+    """Long streaming inputs are split into per-chunk backend calls.
+
+    Bounds peak VRAM: each chunk is a separate generate_*_streaming call with
+    its own short-lived KV cache. Single-chunk inputs keep the original path.
+    """
+
+    def _set_chunk_config(self, oc, max_chars, gap_ms, enabled=True):
+        oc._STREAM_AUTOCHUNK = enabled
+        oc._MIN_CHUNK_CHARS = 5
+        oc._MAX_CHUNK_CHARS = max_chars
+        oc._CHUNK_GAP_MS = gap_ms
+
+    def test_long_pcm_is_chunked_with_gap_and_single_header(self, client, monkeypatch):
+        from api.routers import openai_compatible as oc
+        self._set_chunk_config(oc, max_chars=10, gap_ms=50)
+        # Each backend "call" emits ONE 10-sample PCM chunk so we can detect
+        # chunk boundaries cleanly.
+        backend = _make_mock_backend(chunks=[np.ones(10, dtype=np.float32)], sr=24000)
+        _install_backend(backend)
+        long_text = "Alpha bravo charlie delta echo foxtrot golf."
+        try:
+            with client.stream("POST", "/v1/audio/speech", json={
+                "model": "tts-1", "input": long_text, "voice": "Vivian",
+                "response_format": "wav", "stream_format": "audio",
+            }) as response:
+                assert response.status_code == 200
+                body = b"".join(response.iter_bytes())
+        finally:
+            # Restore defaults so other tests are unaffected.
+            oc._STREAM_AUTOCHUNK = True
+            oc._MIN_CHUNK_CHARS = 20
+            oc._MAX_CHUNK_CHARS = 70
+            oc._CHUNK_GAP_MS = 120
+
+        # Multiple backend streaming calls => multiple chunks synthesized.
+        calls = backend.captures.get("generate_speech_streaming", [])
+        assert len(calls) > 1, f"expected >1 chunked call, got {len(calls)}"
+        # Their texts concatenate to cover the whole input (modulo the splitter).
+        joined = " ".join(c["text"] for c in calls)
+        for word in ("Alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf"):
+            assert word in joined, f"{word!r} missing from chunked texts: {joined!r}"
+
+        # Exactly one WAV header for the whole multi-chunk stream.
+        assert body.count(b"RIFF") == 1
+        assert body.count(b"WAVE") == 1
+        assert body.count(b"data") == 1
+        # 44-byte header + (N chunks * 10 samples * 2 bytes) + (gaps * 50ms).
+        # gap_samples = int(24000 * 50 / 1000) = 1200 samples per boundary.
+        n_calls = len(calls)
+        gap_samples = int(24000 * 50 / 1000)
+        expected_pcm = n_calls * 10 * 2 + (n_calls - 1) * gap_samples * 2
+        assert len(body) == 44 + expected_pcm, (
+            len(body), 44 + expected_pcm, n_calls
+        )
+
+    def test_short_text_single_chunk_unchanged(self, client):
+        from api.routers import openai_compatible as oc
+        # Defaults already give single-chunk for short text.
+        assert oc._STREAM_AUTOCHUNK is True
+        backend = _make_mock_backend(
+            chunks=[np.zeros(8, dtype=np.float32), np.ones(8, dtype=np.float32) * 0.5],
+            sr=24000,
+        )
+        _install_backend(backend)
+        with client.stream("POST", "/v1/audio/speech", json={
+            "model": "tts-1", "input": "hi", "voice": "Vivian",
+            "response_format": "pcm", "stream_format": "audio",
+        }) as response:
+            assert response.status_code == 200
+            body = b"".join(response.iter_bytes())
+        # One backend call only.
+        assert len(backend.captures["generate_speech_streaming"]) == 1
+        # Two 8-sample chunks => 32 bytes, no gap.
+        assert len(body) == 32
+
+    def test_stream_autochunk_disabled_monolithic(self, client):
+        from api.routers import openai_compatible as oc
+        oc._STREAM_AUTOCHUNK = False
+        oc._MAX_CHUNK_CHARS = 5  # would split if chunking were on
+        try:
+            backend = _make_mock_backend(
+                chunks=[np.ones(10, dtype=np.float32)], sr=24000,
+            )
+            _install_backend(backend)
+            long_text = "Alpha bravo charlie delta echo foxtrot golf."
+            with client.stream("POST", "/v1/audio/speech", json={
+                "model": "tts-1", "input": long_text, "voice": "Vivian",
+                "response_format": "pcm", "stream_format": "audio",
+            }) as response:
+                assert response.status_code == 200
+                body = b"".join(response.iter_bytes())
+        finally:
+            oc._STREAM_AUTOCHUNK = True
+            oc._MAX_CHUNK_CHARS = 70
+        # With chunking OFF, exactly one backend call with the full text.
+        calls = backend.captures["generate_speech_streaming"]
+        assert len(calls) == 1
+        assert calls[0]["text"] == long_text
+        # One chunk * 10 samples * 2 bytes = 20 bytes, no gap.
+        assert len(body) == 20

@@ -61,18 +61,21 @@ _generation_semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
 # (, ; :), then word boundaries. Chunks are packed greedily up to max_chars and
 # kept at/above min_chars where possible (a too-small piece is merged with a
 # neighbour as long as the result still fits within max_chars).
-#   TTS_AUTOCHUNK=false        disable entirely
-#   TTS_MIN_CHUNK_CHARS=20     soft lower bound per chunk
-#   TTS_MAX_CHUNK_CHARS=70     hard upper bound per chunk
-#   TTS_CHUNK_GAP_MS=120       silence inserted between merged chunks
+#   TTS_AUTOCHUNK=false        disable non-streaming chunking entirely
+#   TTS_STREAM_AUTOCHUNK=false disable chunking for streaming requests
+#   TTS_MIN_CHUNK_CHARS=20     soft lower bound per chunk (shared)
+#   TTS_MAX_CHUNK_CHARS=70     hard upper bound per chunk (shared)
+#   TTS_CHUNK_GAP_MS=120       silence inserted between merged chunks (shared)
 try:
     _AUTOCHUNK = os.getenv("TTS_AUTOCHUNK", "true").lower() == "true"
+    _STREAM_AUTOCHUNK = os.getenv("TTS_STREAM_AUTOCHUNK", "true").lower() == "true"
     _MIN_CHUNK_CHARS = max(1, int(os.getenv("TTS_MIN_CHUNK_CHARS", "20")))
     _MAX_CHUNK_CHARS = max(_MIN_CHUNK_CHARS, int(os.getenv("TTS_MAX_CHUNK_CHARS", "70")))
     _CHUNK_GAP_MS = max(0, int(os.getenv("TTS_CHUNK_GAP_MS", "120")))
 except ValueError:
     logger.warning("Invalid auto-chunk env value; using defaults")
-    _AUTOCHUNK, _MIN_CHUNK_CHARS, _MAX_CHUNK_CHARS, _CHUNK_GAP_MS = True, 20, 70, 120
+    _AUTOCHUNK, _STREAM_AUTOCHUNK = True, True
+    _MIN_CHUNK_CHARS, _MAX_CHUNK_CHARS, _CHUNK_GAP_MS = 20, 70, 120
 
 
 def _pieces(text: str, max_chars: int) -> List[str]:
@@ -546,6 +549,69 @@ async def _drain_and_encode(
     return audio_bytes, sr, len(audio)
 
 
+async def _chunked_stream_drain(
+    text_chunks: List[str],
+    make_gen,
+    fmt: str,
+    sr_default: int,
+):
+    """Drive a backend streaming generator *per text chunk* and unify output.
+
+    Bounds peak VRAM for long streaming requests: each chunk is a separate
+    ``stream_generate_*`` call with its own short-lived KV cache, freed before
+    the next chunk starts (matching the non-streaming chunking path).
+
+    ``make_gen(text) -> async_generator[(pcm_chunk, sr)]`` builds one backend
+    streaming generator for a single chunk's text. The gap between chunks is a
+    silence of ``_CHUNK_GAP_MS`` ms (zeros), identical to the non-streaming
+    chunk path — no crossfade.
+
+    Yields ``(pcm_chunk, sr)`` for ``pcm``/``wav`` (caller encodes/headers).
+    For compressed formats, accumulates all PCM into one array and yields a
+    single ``(audio_np, sr)`` so the caller can encode it once (multiple
+    separate container headers would be corrupt).
+    """
+    is_raw = fmt in ("pcm", "wav")
+    gap_ms = _CHUNK_GAP_MS if is_raw else 0
+    accumulator: List[np.ndarray] = []
+    sr = sr_default
+    gap: Optional[np.ndarray] = None
+    emitted_any = False  # gate the inter-chunk gap on first *emitted* chunk
+    for idx, seg in enumerate(text_chunks):
+        if not seg or not seg.strip():
+            continue
+        chunk_emitted = False
+        async for pcm_chunk, chunk_sr in make_gen(seg):
+            if pcm_chunk is None or len(pcm_chunk) == 0:
+                continue
+            pcm = np.asarray(pcm_chunk, dtype=np.float32)
+            sr = chunk_sr if chunk_sr else sr
+            if is_raw:
+                # Insert the inter-chunk silence gap before the FIRST emitted
+                # PCM of each text chunk, except the very first chunk overall.
+                if emitted_any and not chunk_emitted:
+                    if gap is None and gap_ms > 0:
+                        gap = np.zeros(int(sr * gap_ms / 1000.0), dtype=np.float32)
+                    if gap is not None and len(gap) > 0:
+                        yield gap, sr
+                yield pcm, sr
+                emitted_any = True
+                chunk_emitted = True
+            else:
+                accumulator.append(pcm)
+                emitted_any = True
+                chunk_emitted = True
+        if not chunk_emitted:
+            logger.warning("Streaming chunk %d/%d produced no audio", idx + 1, len(text_chunks))
+    if not is_raw:
+        if not accumulator:
+            raise RuntimeError("no audio produced from any chunk")
+        audio = (
+            np.concatenate(accumulator) if len(accumulator) > 1 else accumulator[0]
+        )
+        yield audio, sr
+
+
 def _stream_headers(fmt: str, stream_format: str) -> dict:
     """Build response headers for a streaming speech response."""
     if stream_format == "sse":
@@ -719,7 +785,6 @@ async def create_speech(
                 )
 
                 clone_stream_kwargs = {
-                    "text": normalized_text,
                     "ref_audio": ref_audio_np,
                     "ref_audio_sr": ref_sr,
                     "ref_text": profile["ref_text"] or None,
@@ -731,6 +796,25 @@ async def create_speech(
                 ):
                     clone_stream_kwargs["cache_key"] = canonical_key
 
+                # Decide streaming chunking (independent toggle + shared sizes).
+                stream_chunks = (
+                    _split_into_chunks(normalized_text, _MIN_CHUNK_CHARS, _MAX_CHUNK_CHARS)
+                    if _STREAM_AUTOCHUNK else [normalized_text]
+                )
+                if len(stream_chunks) > 1:
+                    logger.info(
+                        "Voice clone stream auto-chunking %d chars into %d chunks "
+                        "(window=%d-%d, gap=%dms)",
+                        len(normalized_text), len(stream_chunks),
+                        _MIN_CHUNK_CHARS, _MAX_CHUNK_CHARS, _CHUNK_GAP_MS,
+                    )
+
+                def _clone_make_gen(text: str):
+                    """Build one backend streaming generator for a single chunk's text."""
+                    return backend.generate_voice_clone_streaming(
+                        text=text, **clone_stream_kwargs,
+                    )
+
                 async def _clone_stream():
                     gen_start = time.time()
                     first_chunk_logged = False
@@ -741,9 +825,17 @@ async def create_speech(
                     try:
                         if fmt in ("pcm", "wav"):
                             async with _generation_semaphore:
-                                async for pcm_chunk, sr in backend.generate_voice_clone_streaming(
-                                    **clone_stream_kwargs,
-                                ):
+                                # Source: single-call (today) or chunked driver.
+                                source = (
+                                    backend.generate_voice_clone_streaming(
+                                        **clone_stream_kwargs, text=normalized_text,
+                                    )
+                                    if len(stream_chunks) <= 1
+                                    else _chunked_stream_drain(
+                                        stream_chunks, _clone_make_gen, fmt, 24000,
+                                    )
+                                )
+                                async for pcm_chunk, sr in source:
                                     if pcm_chunk is None or len(pcm_chunk) == 0:
                                         continue
                                     if not first_chunk_logged:
@@ -770,15 +862,31 @@ async def create_speech(
                                             yield chunk_bytes
                                     await asyncio.sleep(0)
                         else:
-                            # Compressed: drain, encode once, then byte-chunk.
+                            # Compressed: drain all PCM (one chunk or many),
+                            # encode ONCE, then byte-chunk. Multi-chunk must
+                            # accumulate across chunks to avoid N container headers.
                             async with _generation_semaphore:
-                                audio_bytes, sample_rate, total_samples = await _drain_and_encode(
-                                    backend.generate_voice_clone_streaming(
-                                        **clone_stream_kwargs
-                                    ),
-                                    fmt,
-                                    24000,
-                                )
+                                if len(stream_chunks) <= 1:
+                                    audio_bytes, sample_rate, total_samples = await _drain_and_encode(
+                                        backend.generate_voice_clone_streaming(
+                                            **clone_stream_kwargs, text=normalized_text,
+                                        ),
+                                        fmt,
+                                        24000,
+                                    )
+                                else:
+                                    audio_np = None
+                                    async for pcm_chunk, sr in _chunked_stream_drain(
+                                        stream_chunks, _clone_make_gen, fmt, 24000,
+                                    ):
+                                        audio_np = pcm_chunk
+                                        sample_rate = sr
+                                    if audio_np is None:
+                                        raise RuntimeError("no audio produced from any chunk")
+                                    total_samples = len(audio_np)
+                                    audio_bytes = await asyncio.to_thread(
+                                        encode_audio, audio_np, fmt, sample_rate
+                                    )
                                 chunk_count = 1
                             if is_sse:
                                 for slc in iter_encoded_bytes(audio_bytes):
@@ -880,6 +988,29 @@ async def create_speech(
             )
             voice_name = get_voice_name(request.voice)
 
+            # Decide streaming chunking (independent toggle + shared sizes).
+            stream_chunks = (
+                _split_into_chunks(normalized_text, _MIN_CHUNK_CHARS, _MAX_CHUNK_CHARS)
+                if _STREAM_AUTOCHUNK else [normalized_text]
+            )
+            if len(stream_chunks) > 1:
+                logger.info(
+                    "TTS stream auto-chunking %d chars into %d chunks "
+                    "(window=%d-%d, gap=%dms)",
+                    len(normalized_text), len(stream_chunks),
+                    _MIN_CHUNK_CHARS, _MAX_CHUNK_CHARS, _CHUNK_GAP_MS,
+                )
+
+            def _speech_make_gen(text: str):
+                """Build one backend streaming generator for a single chunk's text."""
+                return backend.generate_speech_streaming(
+                    text=text,
+                    voice=voice_name,
+                    language=language,
+                    instruct=request.instructions,
+                    model=request.model,
+                )
+
             if hasattr(backend, "generate_speech_streaming"):
                 # Optimized backend: real incremental PCM generation.
                 async def _speech_stream():
@@ -892,13 +1023,21 @@ async def create_speech(
                     try:
                         if fmt in ("pcm", "wav"):
                             async with _generation_semaphore:
-                                async for pcm_chunk, sr in backend.generate_speech_streaming(
-                                    text=normalized_text,
-                                    voice=voice_name,
-                                    language=language,
-                                    instruct=request.instructions,
-                                    model=request.model,
-                                ):
+                                # Source: single-call (today) or chunked driver.
+                                source = (
+                                    backend.generate_speech_streaming(
+                                        text=normalized_text,
+                                        voice=voice_name,
+                                        language=language,
+                                        instruct=request.instructions,
+                                        model=request.model,
+                                    )
+                                    if len(stream_chunks) <= 1
+                                    else _chunked_stream_drain(
+                                        stream_chunks, _speech_make_gen, fmt, 24000,
+                                    )
+                                )
+                                async for pcm_chunk, sr in source:
                                     if pcm_chunk is None or len(pcm_chunk) == 0:
                                         continue
                                     if not first_chunk_logged:
@@ -925,19 +1064,35 @@ async def create_speech(
                                             yield chunk_bytes
                                     await asyncio.sleep(0)
                         else:
-                            # Compressed: drain, encode once, then byte-chunk.
+                            # Compressed: drain all PCM (one chunk or many),
+                            # encode ONCE, then byte-chunk. Multi-chunk must
+                            # accumulate across chunks to avoid N container headers.
                             async with _generation_semaphore:
-                                audio_bytes, sample_rate, total_samples = await _drain_and_encode(
-                                    backend.generate_speech_streaming(
-                                        text=normalized_text,
-                                        voice=voice_name,
-                                        language=language,
-                                        instruct=request.instructions,
-                                        model=request.model,
-                                    ),
-                                    fmt,
-                                    24000,
-                                )
+                                if len(stream_chunks) <= 1:
+                                    audio_bytes, sample_rate, total_samples = await _drain_and_encode(
+                                        backend.generate_speech_streaming(
+                                            text=normalized_text,
+                                            voice=voice_name,
+                                            language=language,
+                                            instruct=request.instructions,
+                                            model=request.model,
+                                        ),
+                                        fmt,
+                                        24000,
+                                    )
+                                else:
+                                    audio_np = None
+                                    async for pcm_chunk, sr in _chunked_stream_drain(
+                                        stream_chunks, _speech_make_gen, fmt, 24000,
+                                    ):
+                                        audio_np = pcm_chunk
+                                        sample_rate = sr
+                                    if audio_np is None:
+                                        raise RuntimeError("no audio produced from any chunk")
+                                    total_samples = len(audio_np)
+                                    audio_bytes = await asyncio.to_thread(
+                                        encode_audio, audio_np, fmt, sample_rate
+                                    )
                                 chunk_count = 1
                             if is_sse:
                                 for slc in iter_encoded_bytes(audio_bytes):
@@ -1258,7 +1413,7 @@ async def create_voice_clone(
     Clone a voice from reference audio and generate speech.
 
     This endpoint requires the Base model (Qwen3-TTS-12Hz-1.7B-Base).
-    Set TTS_MODEL_NAME=Qwen/Qwen3-TTS-12Hz-1.7B-Base environment variable when starting the server.
+    Set TTS_MODEL_ID=Qwen/Qwen3-TTS-12Hz-1.7B-Base environment variable when starting the server.
 
     Two modes are available:
     - ICL mode (x_vector_only_mode=False): Requires ref_text transcript for best quality
@@ -1274,7 +1429,7 @@ async def create_voice_clone(
                 detail={
                     "error": "voice_cloning_not_supported",
                     "message": "Voice cloning requires the Base model (Qwen3-TTS-12Hz-1.7B-Base). "
-                               "Set TTS_MODEL_NAME=Qwen/Qwen3-TTS-12Hz-1.7B-Base environment variable and restart the server.",
+                               "Set TTS_MODEL_ID=Qwen/Qwen3-TTS-12Hz-1.7B-Base environment variable and restart the server.",
                     "type": "invalid_request_error",
                 },
             )

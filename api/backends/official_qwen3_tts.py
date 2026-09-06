@@ -86,10 +86,10 @@ class OfficialQwen3TTSBackend(TTSBackend):
     def get_voice_design_model_id(self) -> Optional[str]:
         """Return the configured VoiceDesign model hf_id, or None if unset.
 
-        The official backend still loads whichever model `TTS_MODEL_NAME`/
+        The official backend still loads whichever model `TTS_MODEL_ID`/
         `model_name` points at; this only exposes the configured VoiceDesign id
         for discoverability. To run VoiceDesign, set
-        `TTS_MODEL_NAME` to this id (it loads via TTS_MODELS_DIR when set).
+        `TTS_MODEL_ID` to this id (it loads via TTS_MODELS_DIR when set).
         """
         return self._voice_design_model_id
     
