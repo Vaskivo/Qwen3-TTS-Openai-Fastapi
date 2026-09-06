@@ -7,25 +7,12 @@ services:
     container_name: qwen3-tts-api
     ports:
       - "${TTS_PORT:-8880}:8880"
+    env_file: .env
     environment:
-      HOST: 0.0.0.0
-      PORT: 8880
-      WORKERS: 1
-      CORS_ORIGINS: "${CORS_ORIGINS:-*}"
-      # TTS_BACKEND: official
-      TTS_BACKEND: optimized
       # TTS_MODEL_NAME: "${TTS_MODEL_NAME:-Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice}"
-      TTS_MODEL_NAME: "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
-      TTS_WARMUP_ON_START: "${TTS_WARMUP_ON_START:-false}"
-      TTS_IDLE_TIMEOUT_SECONDS: "${TTS_IDLE_TIMEOUT_SECONDS:-0}"
-      NVIDIA_DRIVER_CAPABILITIES: compute,utility
-      VOICE_LIBRARY_DIR: /VOICES
+      # TTS_MODEL_NAME: "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+      # NVIDIA_DRIVER_CAPABILITIES: compute,utility
       TORCHINDUCTOR_COMPILE_THREADS: 1
-      # Folder holding local model snapshots (one subdir per model, repo name
-      # without the org prefix, e.g. /MODELS/Qwen3-TTS-12Hz-1.7B-Base). Required:
-      # this build loads models only from local paths — it does not use the
-      # HuggingFace cache and never downloads.
-      TTS_MODELS_DIR: /MODELS
     volumes:
       - ./VOICES:/VOICES
       - ./config.yaml:/home/appuser/qwen3-tts/config.yaml

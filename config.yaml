@@ -52,11 +52,9 @@ models:
     type: base
 
 # Performance optimizations (only used with TTS_BACKEND=optimized)
+# Note: attention implementation is configured via the TTS_ATTN env var (shared
+# with the official backend), not here.
 optimization:
-  # Attention implementation.  Options: flash_attention_2 | sdpa | eager
-  # flash_attention_2 is fastest on modern GPUs; falls back to sdpa automatically.
-  attention: flash_attention_2
-
   # torch.compile mode.  Options: default | reduce-overhead | max-autotune
   # max-autotune gives the best throughput after a ~75 s compilation on first start.
   # compile_mode: max-autotune
@@ -88,11 +86,6 @@ optimization:
     # Emit a PCM chunk every N decoded frames.  Lower = lower TTFB but slightly
     # higher RTF cost.  Recommended: 6 (good TTFB/RTF balance for voice agents).
     emit_every_frames: 6
-
-# Server listen address and port
-server:
-  host: "0.0.0.0"
-  port: 8880
 
 # Built-in voice definitions (used by the /v1/voices endpoint when the optimized
 # backend is active).  You can add/remove entries here freely.

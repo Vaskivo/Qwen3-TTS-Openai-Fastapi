@@ -72,7 +72,6 @@ class OptimizedQwen3TTSBackend(TTSBackend):
             hf_id: Qwen/Qwen3-TTS-12Hz-0.6B-Base
             type: base
         optimization:
-          attention: flash_attention_2
           use_compile: true
           compile_mode: max-autotune   # "default" | "reduce-overhead" | "max-autotune"
           use_cuda_graphs: true
@@ -330,7 +329,10 @@ class OptimizedQwen3TTSBackend(TTSBackend):
         torch.set_float32_matmul_precision("high")
 
         opt = self.config.get("optimization", {})
-        attn_impl = opt.get("attention", "flash_attention_2")
+        # Attention impl is configured via the TTS_ATTN env var (shared with the
+        # official backend). Default to flash_attention_2 when unset; the try/
+        # except below falls back to sdpa on failure.
+        attn_impl = os.environ.get("TTS_ATTN") or "flash_attention_2"
 
         try:
             loaded = Qwen3TTSModel.from_pretrained(
