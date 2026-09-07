@@ -26,11 +26,20 @@ except ImportError:
     gr = None
     GRADIO_AVAILABLE = False
 
+_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    level=_LOG_LEVEL,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Explicitly set the level on the "api" logger hierarchy so our DEBUG logs (e.g.
+# per-chunk TTS logs) are honored even when uvicorn installs its own logging
+# config, which can reset the root logger level to INFO.
+_api_logger = logging.getLogger("api")
+_api_logger.setLevel(_LOG_LEVEL)
+_api_logger.propagate = True
 
 API_VERSION = "0.1.1"
 
@@ -301,12 +310,17 @@ async def health_check():
 def main() -> None:
     import uvicorn
 
+    # Forward the configured LOG_LEVEL to uvicorn so its logging config does
+    # not reset the root logger to INFO (which would hide our DEBUG logs such
+    # as the per-chunk TTS logs).
+    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
     uvicorn.run(
         "api.main:app",
         host=HOST,
         port=PORT,
         workers=WORKERS,
         reload=False,
+        log_level=log_level.lower(),
     )
 
 

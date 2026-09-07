@@ -39,6 +39,15 @@ class NormalizationOptions(BaseModel):
         default=True,
         description="Replaces the remaining symbols after normalization with their words",
     )
+    markdown_normalization: bool = Field(
+        default=True,
+        description=(
+            "Preprocesses Markdown structure so the model produces natural "
+            "pauses. Headings get a trailing period, paragraph breaks become "
+            "a sentence-ending period, and list items are separated with "
+            "commas so they are not read in a single breath."
+        ),
+    )
 
 
 class OpenAISpeechRequest(BaseModel):

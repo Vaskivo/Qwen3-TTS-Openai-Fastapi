@@ -510,6 +510,7 @@
                             <label><input type="checkbox" id="phoneNormalization" checked> Phone normalization</label>
                             <label><input type="checkbox" id="optionalPluralizationNormalization" checked> Optional pluralization normalization</label>
                             <label><input type="checkbox" id="replaceRemainingSymbols" checked> Replace remaining symbols</label>
+                            <label><input type="checkbox" id="markdownNormalization" checked> Markdown normalization (pauses for headings, paragraphs &amp; lists)</label>
                         </div>
                     </details>
 
@@ -791,6 +792,7 @@ response.<span class="function">stream_to_file</span>(<span class="string">"outp
                             optional_pluralization_normalization: document.getElementById('optionalPluralizationNormalization').checked,
                             phone_normalization: document.getElementById('phoneNormalization').checked,
                             replace_remaining_symbols: document.getElementById('replaceRemainingSymbols').checked,
+                            markdown_normalization: document.getElementById('markdownNormalization').checked,
                         },
                     }),
                 });

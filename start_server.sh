@@ -9,6 +9,7 @@ cd "$SCRIPT_DIR"
 export HOST=${HOST:-"0.0.0.0"}
 export PORT=${PORT:-8880}
 export WORKERS=${WORKERS:-1}
+export LOG_LEVEL=${LOG_LEVEL:-"INFO"}
 export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
 
 # Check for Python virtual environment
@@ -38,4 +39,4 @@ echo "Web Interface: http://$HOST:$PORT/"
 echo ""
 
 # Start the server
-uvicorn api.main:app --host "$HOST" --port "$PORT" --workers "$WORKERS"
+uvicorn api.main:app --host "$HOST" --port "$PORT" --workers "$WORKERS" --log-level "${LOG_LEVEL,,}"

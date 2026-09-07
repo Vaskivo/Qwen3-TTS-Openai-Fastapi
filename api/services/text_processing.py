@@ -99,6 +99,197 @@ NUMBER_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# --- Markdown structure patterns -------------------------------------------
+# ATX headings: 1 to 6 leading '#', optional closing '#'-run. We keep the
+# capture on the heading text so we can append a pause cue after it.
+MARKDOWN_HEADING_PATTERN = re.compile(
+    r"^[ \t]{0,3}(#{1,6})[ \t]+([^\n]+?)[ \t]*(?:#{1,6})?[ \t]*$",
+    re.MULTILINE,
+)
+# Setext headings: a line of text followed by a line of '=' or '-'.
+# Detected *before* other list/block handling so the underline is consumed.
+MARKDOWN_SETEXT_HEADING_PATTERN = re.compile(
+    r"^([^\n]+)\n[ \t]*([=]{2,}|[-]{2,})[ \t]*$", re.MULTILINE)
+# Unordered list bullets: '-', '*', '+' followed by a space.
+MARKDOWN_UNORDERED_LIST_PATTERN = re.compile(r"^( {0,3}[-*+])[ \t]+", re.MULTILINE)
+# Ordered list items: '1.', '2)', '10.' ... followed by a space.
+MARKDOWN_ORDERED_LIST_PATTERN = re.compile(r"^( {0,3}\d{1,9}[.)])[ \t]+", re.MULTILINE)
+# Horizontal rules: '---', '***', '___' (3+ same chars, spaces allowed).
+MARKDOWN_HR_PATTERN = re.compile(
+    r"^[ \t]{0,3}([-*_])([ \t]*\1){2,}[ \t]*$", re.MULTILINE
+)
+# Blockquotes: leading '>' optionally nested.
+MARKDOWN_BLOCKQUOTE_PATTERN = re.compile(r"^( {0,3}>+)[ \t]*", re.MULTILINE)
+# Emphasis / strong markers we simply unwrap (the words stay).
+MARKDOWN_EMPHASIS_PATTERN = re.compile(r"(\*{1,3}|_{1,3})(.+?)\1")
+# Inline code spans: `code` -> code (kept as plain text).
+MARKDOWN_INLINE_CODE_PATTERN = re.compile(r"`([^`\n]+)`")
+# Markdown links/images: [text](url) -> text ; ![alt](url) -> alt
+MARKDOWN_LINK_PATTERN = re.compile(r"!\[([^\]]*)\]\([^)]*\)|\[([^\]]*)\]\([^)]*\)")
+# Fenced code blocks: ``` ... ``` (and indented code blocks of 4+ spaces).
+MARKDOWN_FENCE_PATTERN = re.compile(
+    r"(^|\n)([ \t]{0,3})(`{3,}|~{3,})[^\n]*\n[\s\S]*?\n[ \t]{0,3}\3[ \t]*$",
+    re.MULTILINE,
+)
+
+
+def _has_terminal_punctuation(text: str) -> bool:
+    """Return True if ``text`` already ends with sentence/clause punctuation."""
+    return bool(text) and text[-1] in ".!?;:,:-"
+
+
+def _strip_inline_markdown(text: str) -> str:
+    """Remove inline-only Markdown markers while keeping the readable words."""
+    # Inline code first (so emphasis markers inside are not re-processed).
+    text = MARKDOWN_INLINE_CODE_PATTERN.sub(r"\1", text)
+    # Images and links: keep the visible text/alt text.
+    text = MARKDOWN_LINK_PATTERN.sub(lambda m: (m.group(1) or m.group(2) or ""), text)
+    # Bold/italic markers: unwrap, preserving the inner text.
+    text = MARKDOWN_EMPHASIS_PATTERN.sub(r"\2", text)
+    return text
+
+
+def normalize_markdown(text: str) -> str:
+    """Flatten Markdown structure into spoken-friendly text with pause cues.
+
+    The Markdown is converted to plain text where structural breaks are
+    translated into punctuation the TTS model renders as audible pauses:
+
+    * Headings keep their text and gain a trailing period so the model takes
+      a breath before the body that follows.
+    * Paragraph breaks (one or more blank lines) become a period.
+    * List items are stripped of their bullets/numbers and separated with
+      commas so each item gets its own micro-pause instead of running
+      together; the end of a list gets a period.
+    * Blockquote markers, horizontal rules, fenced/indented code fences,
+      emphasis and link syntax are removed, keeping the readable words.
+
+    The output still contains newlines: the rest of :func:`normalize_text`
+    collapses whitespace afterwards.
+    """
+    if not text:
+        return text
+
+    # 1. Drop fenced code blocks entirely (replace with a blank line so the
+    #    surrounding paragraphs stay separated). Code is rarely meant to be
+    #    spoken verbatim and its punctuation confuses the model.
+    text = MARKDOWN_FENCE_PATTERN.sub(r"\1\2\n", text)
+
+    # 2. Setext headings: 'Title\n===' or 'Title\n---'. Must run before the
+    #    horizontal-rule and unordered-list handling, which would otherwise
+    #    eat the underline as a rule or a bullet line.
+    def _setext(match: re.Match[str]) -> str:
+        return f"# {match.group(1).strip()}"
+
+    text = MARKDOWN_SETEXT_HEADING_PATTERN.sub(_setext, text)
+
+    # 3. Horizontal rules -> a sentence break. Consume the surrounding blank
+    #    lines so we do not emit an empty "sentence" between two pauses.
+    text = re.sub(
+        r"(?:\n[ \t]*)?^[ \t]{0,3}([-*_])([ \t]*\1){2,}[ \t]*$(?:[ \t]*\n)?",
+        ".\n\n",
+        text,
+        flags=re.MULTILINE,
+    )
+
+    # 4. Headings: strip the '#'-run, keep the text, ensure a trailing period.
+    def _heading(match: re.Match[str]) -> str:
+        heading_text = _strip_inline_markdown(match.group(2).strip())
+        if not heading_text:
+            return ""
+        if not _has_terminal_punctuation(heading_text):
+            heading_text += "."
+        # Force a paragraph break after every heading so the body that follows
+        # is synthesized as a separate chunk (real silence) rather than being
+        # comma-joined to the heading by the list/prose run pass below.
+        return f"{heading_text}\n\n"
+
+    text = MARKDOWN_HEADING_PATTERN.sub(_heading, text)
+
+    # 5. Lists. Each list item becomes its own block (its own line, preceded
+    #    by a blank line) so the chunker synthesizes it as a separate chunk with
+    #    a real pause before it.
+    #      * Unordered items ('-', '*', '+') drop their bullet.
+    #      * Ordered items ('1.', '2.', '1)', ...) speak their ordinal first:
+    #        "one, first", "two, second", ...
+    #    Indentation (nested lists) is preserved only in that nested items are
+    #    still recognized as items; each is emitted as its own block regardless
+    #    of depth. A trailing period is added if the item lacks terminal
+    #    punctuation.
+    _unordered_re = re.compile(r"^([ \t]*)([-*+])[ \t]+(.*)$")
+    _ordered_re = re.compile(r"^([ \t]*)(\d{1,9})[.)][ \t]+(.*)$")
+
+    raw_lines = text.split("\n")
+    out: list[str] = []
+    for line in raw_lines:
+        om = _ordered_re.match(line)
+        um = _unordered_re.match(line)
+        if om:
+            number = _number_to_words(om.group(2))
+            item = f"{number}, {om.group(3).strip()}"
+        elif um:
+            item = um.group(3).strip()
+        else:
+            out.append(line)
+            continue
+        if item and not _has_terminal_punctuation(item):
+            item += "."
+        # Each list item is its own block: separate it from the previous line
+        # with a blank line so the chunker gives it its own chunk (and a real
+        # pause before it).
+        if out and out[-1].strip():
+            out.append("")
+        out.append(item)
+    text = "\n".join(out)
+
+    # 6. Blockquote markers: remove the leading '>' runs.
+    text = MARKDOWN_BLOCKQUOTE_PATTERN.sub("", text)
+
+    # 7. Remaining inline markdown (links, emphasis, inline code) on each
+    #    line that was not a structural element.
+    text = _strip_inline_markdown(text)
+
+    # 8. Paragraph / block separation. A blank line (possibly with whitespace)
+    #    marks a structural break. We keep the blank line so that step 9 can
+    #    tell paragraphs (separated by a blank line) from list-item runs (joined
+    #    by a single newline) and so the downstream chunker can split paragraphs
+    #    into separate chunks and insert actual silence between them. If the
+    #    paragraph lacks terminal punctuation we add a period so it still reads
+    #    as a finished sentence. Paragraphs that became only punctuation (e.g.
+    #    a leftover horizontal-rule break) are dropped.
+    def _paragraph_break(match: re.Match[str]) -> str:
+        before = match.group(1).strip()
+        if not before:
+            return "\n\n"
+        if _has_terminal_punctuation(before):
+            return f"{before}\n\n"
+        return f"{before}.\n\n"
+
+    text = re.sub(r"([^\n]*?)\n[ \t]*\n+", _paragraph_break, text)
+    # Drop lines that became only punctuation after the steps above.
+    text = re.sub(r"\n[ \t]*[.!?:;,-][ \t]*(?=\n)", "\n", text)
+
+    # 9. Per-line punctuation. After step 8, paragraph blocks are separated
+    #    by blank lines and lists (handled in step 5) are already collapsed
+    #    into single lines. Any remaining non-blank line is a standalone
+    #    block (a heading, a list, or a prose line the author put on its own
+    #    line). We make sure each such line ends with terminal punctuation so
+    #    it reads as a finished sentence; the downstream chunker then gives
+    #    every line its own chunk with real silence around it. We do NOT
+    #    comma-join consecutive lines here: that used to merge a lead-in line
+    #    into the following list/prose, swallowing the pause between them.
+    lines = text.split("\n")
+    out_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not _has_terminal_punctuation(stripped):
+            out_lines.append(line.rstrip() + ".")
+        else:
+            out_lines.append(line)
+    text = "\n".join(out_lines)
+
+    return text
+
 
 def _number_to_words(number) -> str:
     if INFLECT_ENGINE:
@@ -305,6 +496,9 @@ def normalize_text(text: str, options: Optional[NormalizationOptions] = None) ->
     if not options.normalize:
         return text
 
+    if options.markdown_normalization:
+        text = normalize_markdown(text)
+
     if options.email_normalization:
         text = EMAIL_PATTERN.sub(handle_email, text)
     if options.url_normalization:
@@ -333,7 +527,17 @@ def normalize_text(text: str, options: Optional[NormalizationOptions] = None) ->
 
     text = TIME_PATTERN.sub(handle_time, text)
     text = re.sub(r"[^\S \n]", " ", text)
-    text = text.replace("\n", " ").replace("\r", " ")
+    # Newline handling. With markdown normalization on, paragraph breaks are
+    # meaningful: collapse runs of blank lines into a single newline and KEEP
+    # it as a hard separator so the downstream chunker splits paragraphs into
+    # separate chunks and inserts real silence between them. With markdown
+    # normalization off we preserve the legacy behavior of flattening all
+    # newlines into spaces.
+    text = text.replace("\r", " ")
+    if options.markdown_normalization:
+        text = re.sub(r"\n\s*\n+", "\n", text)
+    else:
+        text = text.replace("\n", " ")
 
     text = re.sub(r"\bD[Rr]\.(?= [A-Z])", "Doctor", text)
     text = re.sub(r"\b(?:Mr\.|MR\.(?= [A-Z]))", "Mister", text)

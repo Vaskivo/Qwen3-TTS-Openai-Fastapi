@@ -15,7 +15,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import List, NamedTuple, Optional
 
 import numpy as np
 import soundfile as sf
@@ -66,82 +66,144 @@ _generation_semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
 #   TTS_MIN_CHUNK_CHARS=20     soft lower bound per chunk (shared)
 #   TTS_MAX_CHUNK_CHARS=70     hard upper bound per chunk (shared)
 #   TTS_CHUNK_GAP_MS=120       silence inserted between merged chunks (shared)
+#   TTS_PARAGRAPH_GAP_MS=250    silence inserted at markdown block boundaries
+#                              (headings, paragraph breaks, lists) so they
+#                              get a more pronounced pause than the regular
+#                              inter-chunk gap. Falls back to TTS_CHUNK_GAP_MS.
 try:
     _AUTOCHUNK = os.getenv("TTS_AUTOCHUNK", "true").lower() == "true"
     _STREAM_AUTOCHUNK = os.getenv("TTS_STREAM_AUTOCHUNK", "true").lower() == "true"
     _MIN_CHUNK_CHARS = max(1, int(os.getenv("TTS_MIN_CHUNK_CHARS", "20")))
     _MAX_CHUNK_CHARS = max(_MIN_CHUNK_CHARS, int(os.getenv("TTS_MAX_CHUNK_CHARS", "70")))
     _CHUNK_GAP_MS = max(0, int(os.getenv("TTS_CHUNK_GAP_MS", "120")))
+    # Markdown block boundaries (heading, paragraph break, list) get a more
+    # pronounced pause than regular inter-chunk gaps. Defaults to 250ms so
+    # block transitions read as deliberate pauses; set to 0 to disable or to
+    # a custom value to tune. When unset AND TTS_CHUNK_GAP_MS is explicitly 0,
+    # this also defaults to 0 (respecting a "no silence anywhere" config).
+    _default_paragraph_gap = "0" if _CHUNK_GAP_MS == 0 else "250"
+    _PARAGRAPH_GAP_MS = max(0, int(os.getenv("TTS_PARAGRAPH_GAP_MS", _default_paragraph_gap)))
 except ValueError:
     logger.warning("Invalid auto-chunk env value; using defaults")
     _AUTOCHUNK, _STREAM_AUTOCHUNK = True, True
     _MIN_CHUNK_CHARS, _MAX_CHUNK_CHARS, _CHUNK_GAP_MS = 20, 70, 120
+    _PARAGRAPH_GAP_MS = 250
 
 
-def _pieces(text: str, max_chars: int) -> List[str]:
-    """Break text into pieces each <= max_chars, splitting on sentence
-    punctuation (. ! ?), then clause punctuation (, ; :), then words."""
-    out: List[str] = []
-    for sent in re.split(r"(?<=[.!?])\s+", text.strip()):
-        sent = sent.strip()
-        if not sent:
+def _pieces(text: str, max_chars: int) -> List[Optional[str]]:
+    """Break text into pieces each <= max_chars, splitting on hard newlines
+    first (paragraph boundaries), then sentence punctuation (. ! ?), then
+    clause punctuation (, ; :), then words.
+
+    Returns a list of piece strings interspersed with ``None`` sentinels that
+    mark hard paragraph/block boundaries the chunk packer must never cross, so
+    blocks become separate chunks and the merge step inserts real silence
+    between them.
+    """
+    out: List[Optional[str]] = []
+    # Hard-split on newlines first so blocks never merge into one piece.
+    paragraphs = re.split(r"\n+", text.strip())
+    for p_idx, paragraph in enumerate(paragraphs):
+        paragraph = paragraph.strip()
+        if not paragraph:
             continue
-        if len(sent) <= max_chars:
-            out.append(sent)
-            continue
-        for clause in re.split(r"(?<=[,;:])\s+", sent):
-            clause = clause.strip()
-            if not clause:
+        if p_idx:
+            # Hard boundary between blocks.
+            out.append(None)
+        for sent in re.split(r"(?<=[.!?])\s+", paragraph):
+            sent = sent.strip()
+            if not sent:
                 continue
-            if len(clause) <= max_chars:
-                out.append(clause)
+            if len(sent) <= max_chars:
+                out.append(sent)
                 continue
-            buf = ""
-            for w in clause.split():
-                if not buf:
-                    buf = w
-                elif len(buf) + 1 + len(w) <= max_chars:
-                    buf += " " + w
-                else:
+            for clause in re.split(r"(?<=[,;:])\s+", sent):
+                clause = clause.strip()
+                if not clause:
+                    continue
+                if len(clause) <= max_chars:
+                    out.append(clause)
+                    continue
+                buf = ""
+                for w in clause.split():
+                    if not buf:
+                        buf = w
+                    elif len(buf) + 1 + len(w) <= max_chars:
+                        buf += " " + w
+                    else:
+                        out.append(buf)
+                        buf = w
+                if buf:
                     out.append(buf)
-                    buf = w
-            if buf:
-                out.append(buf)
     return out
 
 
-def _split_into_chunks(text: str, min_chars: int, max_chars: int) -> List[str]:
+class Chunk(NamedTuple):
+    """A synthesized chunk and whether a Markdown block boundary precedes it.
+
+    ``starts_block`` is True when the chunk begins a new Markdown block
+    (heading, paragraph, list, etc.). The merge step uses the longer
+    ``_PARAGRAPH_GAP_MS`` before such chunks and the regular
+    ``_CHUNK_GAP_MS`` before sentence-level chunks.
+    """
+    text: str
+    starts_block: bool = False
+
+
+def _split_into_chunks(text: str, min_chars: int, max_chars: int) -> List[Chunk]:
     """Split text into chunks within a [min_chars, max_chars] window, breaking
     at punctuation. Pieces are packed greedily up to max_chars; a chunk shorter
-    than min_chars is merged into a neighbour when the result still fits."""
+    than min_chars is merged into a neighbour when the result still fits.
+
+    Each returned ``Chunk`` records whether it starts a new Markdown block
+    (``starts_block=True``) so callers can insert a more pronounced pause there.
+    """
     pieces = _pieces(text, max_chars)
     if not pieces:
         return []
-    # Greedy pack up to max_chars.
-    chunks: List[str] = []
+    # Greedy pack up to max_chars. ``None`` pieces are hard block boundaries:
+    # flush the current buffer (and record the boundary) so blocks never merge
+    # into one chunk and the merge step inserts real silence between them.
+    # ``pending_block`` marks that the next emitted chunk starts a new block.
+    packed: List[Optional[str]] = []
+    pending_block = True  # the very first chunk always starts a block
     buf = ""
     for p in pieces:
+        if p is None:
+            if buf:
+                packed.append(buf)
+                buf = ""
+            packed.append(None)
+            pending_block = True
+            continue
         if not buf:
             buf = p
         elif len(buf) + 1 + len(p) <= max_chars:
             buf += " " + p
         else:
-            chunks.append(buf)
+            packed.append(buf)
             buf = p
     if buf:
-        chunks.append(buf)
-    # Soft minimum: fold an undersized chunk into a neighbour if it still fits.
-    merged: List[str] = []
-    for c in chunks:
+        packed.append(buf)
+    # Soft minimum: fold an undersized chunk into a neighbour if it still fits,
+    # but never across a hard block boundary (None). Track which chunks start a
+    # block so the merge step can use the right gap size.
+    merged: List[Chunk] = []
+    for c in packed:
+        if c is None:
+            pending_block = True
+            continue
         if (
             merged
-            and (len(c) < min_chars or len(merged[-1]) < min_chars)
-            and len(merged[-1]) + 1 + len(c) <= max_chars
+            and not pending_block
+            and (len(c) < min_chars or len(merged[-1].text) < min_chars)
+            and len(merged[-1].text) + 1 + len(c) <= max_chars
         ):
-            merged[-1] = merged[-1] + " " + c
+            merged[-1] = Chunk(merged[-1].text + " " + c, merged[-1].starts_block)
         else:
-            merged.append(c)
-    return [c for c in merged if c.strip()]
+            merged.append(Chunk(c, pending_block))
+            pending_block = False
+    return [c for c in merged if c.text and c.text.strip()]
 # -----------------------------------------------------------------------------
 
 # Voice library: saved voice profiles used via the "clone:ProfileName" voice prefix.
@@ -418,39 +480,56 @@ async def generate_speech(
         )
 
     # Decide chunking. A single chunk (or disabled) takes the original path.
-    chunks = (
-        _split_into_chunks(text, _MIN_CHUNK_CHARS, _MAX_CHUNK_CHARS)
-        if _AUTOCHUNK else [text]
-    )
+    if _AUTOCHUNK:
+        chunks = _split_into_chunks(text, _MIN_CHUNK_CHARS, _MAX_CHUNK_CHARS)
+    else:
+        chunks = [Chunk(text, starts_block=True)] if text.strip() else []
     if len(chunks) <= 1:
+        seg = chunks[0].text if chunks else text
+        logger.debug(
+            "TTS single chunk (no gaps): %r", seg,
+        )
         try:
-            return await _synth(text)
+            return await _synth(seg)
         except Exception as e:
             raise RuntimeError(f"Speech generation failed: {e}")
 
-    # Multi-chunk: synthesize each sentence-group, then merge with a short gap.
+    # Multi-chunk: synthesize each block, then merge with a gap. Markdown
+    # block boundaries (headings, paragraphs, lists) use a more pronounced
+    # gap (``_PARAGRAPH_GAP_MS``) than sentence-level splits within a
+    # paragraph (``_CHUNK_GAP_MS``).
     logger.info(
-        "Auto-chunking %d chars into %d chunks (window=%d-%d)",
+        "Auto-chunking %d chars into %d chunks (window=%d-%d, gap=%dms, "
+        "block-gap=%dms)",
         len(text), len(chunks), _MIN_CHUNK_CHARS, _MAX_CHUNK_CHARS,
+        _CHUNK_GAP_MS, _PARAGRAPH_GAP_MS,
     )
     try:
         audios: List[np.ndarray] = []
         sr = DEFAULT_SAMPLE_RATE
-        for i, seg in enumerate(chunks):
-            a, sr = await _synth(seg)
+        for i, chunk in enumerate(chunks):
+            a, sr = await _synth(chunk.text)
             if a is not None and len(a):
                 audios.append(np.asarray(a))
         if not audios:
             raise RuntimeError("no audio produced from any chunk")
-        gap_len = int(sr * _CHUNK_GAP_MS / 1000.0)
-        gap = (
-            np.zeros(gap_len, dtype=audios[0].dtype)
-            if gap_len > 0 else None
-        )
         merged: List[np.ndarray] = []
-        for i, a in enumerate(audios):
-            if i and gap is not None:
-                merged.append(gap)
+        for i, (chunk, a) in enumerate(zip(chunks, audios)):
+            if i:
+                gap_ms = _PARAGRAPH_GAP_MS if chunk.starts_block else _CHUNK_GAP_MS
+                gap_len = int(sr * gap_ms / 1000.0)
+                logger.debug(
+                    "TTS chunk %d/%d: text=%r silence_before=%dms (%s)",
+                    i, len(chunks), chunk.text, gap_ms,
+                    "block boundary" if chunk.starts_block else "sentence split",
+                )
+                if gap_len > 0:
+                    merged.append(np.zeros(gap_len, dtype=audios[0].dtype))
+            else:
+                logger.debug(
+                    "TTS chunk %d/%d: text=%r silence_before=0ms (first chunk)",
+                    i, len(chunks), chunk.text,
+                )
             merged.append(a)
         return np.concatenate(merged), sr
     except Exception as e:
@@ -550,7 +629,7 @@ async def _drain_and_encode(
 
 
 async def _chunked_stream_drain(
-    text_chunks: List[str],
+    text_chunks: List[Chunk],
     make_gen,
     fmt: str,
     sr_default: int,
@@ -563,8 +642,10 @@ async def _chunked_stream_drain(
 
     ``make_gen(text) -> async_generator[(pcm_chunk, sr)]`` builds one backend
     streaming generator for a single chunk's text. The gap between chunks is a
-    silence of ``_CHUNK_GAP_MS`` ms (zeros), identical to the non-streaming
-    chunk path — no crossfade.
+    silence of ``_PARAGRAPH_GAP_MS`` ms (zeros) at Markdown block boundaries and
+    ``_CHUNK_GAP_MS`` ms at sentence-level splits — identical to the
+    non-streaming chunk path. For compressed formats no gap is inserted (the
+    whole audio is encoded once).
 
     Yields ``(pcm_chunk, sr)`` for ``pcm``/``wav`` (caller encodes/headers).
     For compressed formats, accumulates all PCM into one array and yields a
@@ -572,12 +653,27 @@ async def _chunked_stream_drain(
     separate container headers would be corrupt).
     """
     is_raw = fmt in ("pcm", "wav")
-    gap_ms = _CHUNK_GAP_MS if is_raw else 0
     accumulator: List[np.ndarray] = []
     sr = sr_default
-    gap: Optional[np.ndarray] = None
+    gap_cache: dict = {}
     emitted_any = False  # gate the inter-chunk gap on first *emitted* chunk
-    for idx, seg in enumerate(text_chunks):
+
+    def _gap_for(chunk: Chunk) -> Optional[np.ndarray]:
+        if not is_raw:
+            return None
+        gap_ms = _PARAGRAPH_GAP_MS if chunk.starts_block else _CHUNK_GAP_MS
+        if gap_ms <= 0:
+            return None
+        if gap_ms not in gap_cache:
+            gap_cache[gap_ms] = np.zeros(
+                int(sr * gap_ms / 1000.0), dtype=np.float32
+            )
+        return gap_cache[gap_ms]
+
+    total = len(text_chunks)
+    for idx, chunk in enumerate(text_chunks):
+        seg = chunk.text if isinstance(chunk, Chunk) else chunk
+        starts_block = chunk.starts_block if isinstance(chunk, Chunk) else False
         if not seg or not seg.strip():
             continue
         chunk_emitted = False
@@ -590,8 +686,7 @@ async def _chunked_stream_drain(
                 # Insert the inter-chunk silence gap before the FIRST emitted
                 # PCM of each text chunk, except the very first chunk overall.
                 if emitted_any and not chunk_emitted:
-                    if gap is None and gap_ms > 0:
-                        gap = np.zeros(int(sr * gap_ms / 1000.0), dtype=np.float32)
+                    gap = _gap_for(Chunk(seg, starts_block))
                     if gap is not None and len(gap) > 0:
                         yield gap, sr
                 yield pcm, sr
@@ -602,7 +697,14 @@ async def _chunked_stream_drain(
                 emitted_any = True
                 chunk_emitted = True
         if not chunk_emitted:
-            logger.warning("Streaming chunk %d/%d produced no audio", idx + 1, len(text_chunks))
+            logger.warning("Streaming chunk %d/%d produced no audio", idx + 1, total)
+        if emitted_any and is_raw:
+            gap_ms = _PARAGRAPH_GAP_MS if starts_block else _CHUNK_GAP_MS
+            logger.debug(
+                "TTS stream chunk %d/%d: text=%r silence_before=%dms (%s)",
+                idx + 1, total, seg, gap_ms,
+                "block boundary" if starts_block else "sentence split",
+            )
     if not is_raw:
         if not accumulator:
             raise RuntimeError("no audio produced from any chunk")
@@ -799,14 +901,14 @@ async def create_speech(
                 # Decide streaming chunking (independent toggle + shared sizes).
                 stream_chunks = (
                     _split_into_chunks(normalized_text, _MIN_CHUNK_CHARS, _MAX_CHUNK_CHARS)
-                    if _STREAM_AUTOCHUNK else [normalized_text]
+                    if _STREAM_AUTOCHUNK else [Chunk(normalized_text, starts_block=True)]
                 )
                 if len(stream_chunks) > 1:
                     logger.info(
                         "Voice clone stream auto-chunking %d chars into %d chunks "
-                        "(window=%d-%d, gap=%dms)",
+                        "(window=%d-%d, gap=%dms, block-gap=%dms)",
                         len(normalized_text), len(stream_chunks),
-                        _MIN_CHUNK_CHARS, _MAX_CHUNK_CHARS, _CHUNK_GAP_MS,
+                        _MIN_CHUNK_CHARS, _MAX_CHUNK_CHARS, _CHUNK_GAP_MS, _PARAGRAPH_GAP_MS,
                     )
 
                 def _clone_make_gen(text: str):
@@ -826,15 +928,18 @@ async def create_speech(
                         if fmt in ("pcm", "wav"):
                             async with _generation_semaphore:
                                 # Source: single-call (today) or chunked driver.
-                                source = (
-                                    backend.generate_voice_clone_streaming(
+                                if len(stream_chunks) <= 1:
+                                    logger.debug(
+                                        "TTS clone stream single chunk (no gaps): %r",
+                                        normalized_text,
+                                    )
+                                    source = backend.generate_voice_clone_streaming(
                                         **clone_stream_kwargs, text=normalized_text,
                                     )
-                                    if len(stream_chunks) <= 1
-                                    else _chunked_stream_drain(
+                                else:
+                                    source = _chunked_stream_drain(
                                         stream_chunks, _clone_make_gen, fmt, 24000,
                                     )
-                                )
                                 async for pcm_chunk, sr in source:
                                     if pcm_chunk is None or len(pcm_chunk) == 0:
                                         continue
@@ -939,10 +1044,12 @@ async def create_speech(
                     headers=_stream_headers(fmt, request.stream_format),
                 )
             else:
-                # Non-streaming path — honor the requested format (including wav)
+                # Non-streaming path — honor the requested format (including wav).
+                # Chunk the normalized text (same logic as built-in voices) so
+                # Markdown block boundaries get a more pronounced pause and so
+                # long inputs stay within the model's effective context window.
                 gen_start = time.time()
                 clone_kwargs = {
-                    "text": normalized_text,
                     "ref_audio": ref_audio_np,
                     "ref_audio_sr": ref_sr,
                     "ref_text": profile["ref_text"] or None,
@@ -952,8 +1059,77 @@ async def create_speech(
                 }
                 if _method_accepts_kwarg(backend.generate_voice_clone, "cache_key"):
                     clone_kwargs["cache_key"] = canonical_key
-                async with _generation_semaphore:
-                    audio, sample_rate = await backend.generate_voice_clone(**clone_kwargs)
+
+                if _AUTOCHUNK:
+                    chunks = _split_into_chunks(
+                        normalized_text, _MIN_CHUNK_CHARS, _MAX_CHUNK_CHARS
+                    )
+                else:
+                    chunks = (
+                        [Chunk(normalized_text, starts_block=True)]
+                        if normalized_text.strip() else []
+                    )
+
+                async def _clone_synth(segment: str) -> tuple:
+                    return await backend.generate_voice_clone(
+                        text=segment, **clone_kwargs
+                    )
+
+                if len(chunks) <= 1:
+                    seg = chunks[0].text if chunks else normalized_text
+                    logger.debug(
+                        "TTS clone single chunk (no gaps): %r", seg,
+                    )
+                    async with _generation_semaphore:
+                        audio, sample_rate = await _clone_synth(seg)
+                else:
+                    logger.info(
+                        "Voice clone auto-chunking %d chars into %d chunks "
+                        "(window=%d-%d, gap=%dms, block-gap=%dms)",
+                        len(normalized_text), len(chunks), _MIN_CHUNK_CHARS,
+                        _MAX_CHUNK_CHARS, _CHUNK_GAP_MS, _PARAGRAPH_GAP_MS,
+                    )
+                    audios: List[np.ndarray] = []
+                    sample_rate = 24000
+                    async with _generation_semaphore:
+                        for chunk in chunks:
+                            a, sr = await _clone_synth(chunk.text)
+                            if a is not None and len(a):
+                                audios.append(np.asarray(a))
+                                sample_rate = sr
+                    if not audios:
+                        raise RuntimeError("no audio produced from any chunk")
+                    merged: List[np.ndarray] = []
+                    for i, (chunk, a) in enumerate(zip(chunks, audios)):
+                        if i:
+                            gap_ms = (
+                                _PARAGRAPH_GAP_MS if chunk.starts_block
+                                else _CHUNK_GAP_MS
+                            )
+                            gap_len = int(sample_rate * gap_ms / 1000.0)
+                            logger.debug(
+                                "TTS clone chunk %d/%d: text=%r "
+                                "silence_before=%dms (%s)",
+                                i, len(chunks), chunk.text, gap_ms,
+                                "block boundary" if chunk.starts_block
+                                else "sentence split",
+                            )
+                            if gap_len > 0:
+                                merged.append(
+                                    np.zeros(gap_len, dtype=audios[0].dtype)
+                                )
+                        else:
+                            logger.debug(
+                                "TTS clone chunk %d/%d: text=%r "
+                                "silence_before=0ms (first chunk)",
+                                i, len(chunks), chunk.text,
+                            )
+                        merged.append(a)
+                    audio = (
+                        np.concatenate(merged) if len(merged) > 1
+                        else merged[0]
+                    )
+
                 gen_time = time.time() - gen_start
                 audio_dur = len(audio) / sample_rate if sample_rate > 0 else 0
                 rtf = gen_time / audio_dur if audio_dur > 0 else 0
@@ -991,14 +1167,14 @@ async def create_speech(
             # Decide streaming chunking (independent toggle + shared sizes).
             stream_chunks = (
                 _split_into_chunks(normalized_text, _MIN_CHUNK_CHARS, _MAX_CHUNK_CHARS)
-                if _STREAM_AUTOCHUNK else [normalized_text]
+                if _STREAM_AUTOCHUNK else [Chunk(normalized_text, starts_block=True)]
             )
             if len(stream_chunks) > 1:
                 logger.info(
                     "TTS stream auto-chunking %d chars into %d chunks "
-                    "(window=%d-%d, gap=%dms)",
+                    "(window=%d-%d, gap=%dms, block-gap=%dms)",
                     len(normalized_text), len(stream_chunks),
-                    _MIN_CHUNK_CHARS, _MAX_CHUNK_CHARS, _CHUNK_GAP_MS,
+                    _MIN_CHUNK_CHARS, _MAX_CHUNK_CHARS, _CHUNK_GAP_MS, _PARAGRAPH_GAP_MS,
                 )
 
             def _speech_make_gen(text: str):
@@ -1024,19 +1200,22 @@ async def create_speech(
                         if fmt in ("pcm", "wav"):
                             async with _generation_semaphore:
                                 # Source: single-call (today) or chunked driver.
-                                source = (
-                                    backend.generate_speech_streaming(
+                                if len(stream_chunks) <= 1:
+                                    logger.debug(
+                                        "TTS stream single chunk (no gaps): %r",
+                                        normalized_text,
+                                    )
+                                    source = backend.generate_speech_streaming(
                                         text=normalized_text,
                                         voice=voice_name,
                                         language=language,
                                         instruct=request.instructions,
                                         model=request.model,
                                     )
-                                    if len(stream_chunks) <= 1
-                                    else _chunked_stream_drain(
+                                else:
+                                    source = _chunked_stream_drain(
                                         stream_chunks, _speech_make_gen, fmt, 24000,
                                     )
-                                )
                                 async for pcm_chunk, sr in source:
                                     if pcm_chunk is None or len(pcm_chunk) == 0:
                                         continue

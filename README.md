@@ -385,6 +385,7 @@ Review device mappings in `docker-compose.rocm.yml`; render-node names vary betw
 | `TTS_MIN_CHUNK_CHARS` | `20` | Soft minimum chunk length (shared by both paths) |
 | `TTS_MAX_CHUNK_CHARS` | `70` | Target maximum chunk length (shared by both paths) |
 | `TTS_CHUNK_GAP_MS` | `120` | Silence inserted between generated chunks (shared by both paths) |
+| `TTS_PARAGRAPH_GAP_MS` | `250` | Silence inserted at Markdown block boundaries (headings, paragraph breaks, lists). Set to `0` to disable |
 
 Invalid float settings fall back to safe defaults instead of crashing module import.
 
