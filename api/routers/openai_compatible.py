@@ -22,7 +22,7 @@ import soundfile as sf
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
-from ..security import require_api_key
+from ..security import require_auth
 
 from ..structures.schemas import (
     OpenAISpeechRequest,
@@ -221,8 +221,9 @@ _ref_audio_cache: dict = {}
 router = APIRouter(
     tags=["OpenAI Compatible TTS"],
     responses={404: {"description": "Not found"}},
-    # Enforce API-key auth on every route in this router when API_KEY is set.
-    dependencies=[Depends(require_api_key)],
+    # Enforce configured credentials (API_KEY and/or UI_USER+UI_PASSWORD)
+    # on every route in this router when auth is enabled.
+    dependencies=[Depends(require_auth)],
 )
 
 

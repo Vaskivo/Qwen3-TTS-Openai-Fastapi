@@ -18,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .security import is_auth_enabled, require_api_key
+from .security import is_auth_enabled, require_auth, gated_asgi_app
 
 try:
     import gradio as gr
@@ -192,13 +192,12 @@ app = FastAPI(
     ),
     version=API_VERSION,
     lifespan=lifespan,
-    # Hide the interactive docs/redoc/openapi schema when auth is enabled so
-    # the OpenAPI schema and a runnable UI aren't exposed without a key.
-    # Operators who want the docs UI back can simply leave API_KEY unset
-    # (e.g. on a trusted/localhost deployment) and re-enable it.
-    docs_url=None if is_auth_enabled() else "/docs",
-    redoc_url=None if is_auth_enabled() else "/redoc",
-    openapi_url=None if is_auth_enabled() else "/openapi.json",
+    # Docs are protected by the same auth as everything else (Basic for
+    # browsers, Bearer/X-API-Key for clients), so keep them available when
+    # auth is enabled. Their "Try it out" calls carry the caller's credentials.
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
 )
 
 # Browsers reject credentialed wildcard CORS. Keep wildcard convenient for
@@ -216,11 +215,10 @@ from .routers.openai_compatible import router as openai_router
 app.include_router(openai_router, prefix="/v1")
 
 if STATIC_DIR.exists():
-    # Gate static assets behind the same API-key check as the rest of the API.
+    # Gate static assets behind the same credentials as the rest of the API.
     # ``StaticFiles`` is a mounted ASGI sub-app and isn't covered by the
     # router-level dependency above, so wrap it in a tiny ASGI middleware that
-    # enforces the key before delegating to StaticFiles.
-    from .security import gated_asgi_app
+    # enforces credentials before delegating to StaticFiles.
     app.mount("/static", gated_asgi_app(StaticFiles(directory=str(STATIC_DIR))), name="static")
 
 if ENABLE_VOICE_STUDIO:
@@ -237,11 +235,11 @@ if ENABLE_VOICE_STUDIO:
 
             if is_auth_enabled():
                 logger.warning(
-                    "ENABLE_VOICE_STUDIO=true with API_KEY set: the Gradio UI is "
-                    "mounted at /voice-studio WITHOUT API-key gating (Gradio manages "
-                    "its own routing). Its backend calls to /v1/* are still gated, "
-                    "but the UI itself will be public. Avoid exposing this on an "
-                    "untrusted network, or leave API_KEY unset."
+                    "ENABLE_VOICE_STUDIO=true with auth enabled: the Gradio UI is "
+                    "mounted at /voice-studio WITHOUT the server's credential check "
+                    "(Gradio manages its own routing). Its backend calls to /v1/* are "
+                    "still protected, but the UI itself will be public. Avoid exposing "
+                    "this on an untrusted network, or leave credentials unset."
                 )
 
             voice_studio_host = "localhost" if HOST in {"0.0.0.0", "::"} else HOST
@@ -254,7 +252,7 @@ if ENABLE_VOICE_STUDIO:
             logger.warning("Failed to mount Voice Studio: %s", exc)
 
 
-@app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_api_key)])
+@app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_auth)])
 async def root():
     index_path = STATIC_DIR / "index.html"
     if index_path.exists():

@@ -1,103 +1,232 @@
 # coding=utf-8
 # SPDX-License-Identifier: Apache-2.0
-"""API-key authentication for the Qwen3-TTS API.
+"""Unified authentication for the Qwen3-TTS API.
 
-When the ``API_KEY`` environment variable is set, every protected route
-requires a matching key. When it is unset (local/dev), authentication is
-disabled and all routes are open — so existing deployments keep working
-unless an operator opts in by setting ``API_KEY``.
+Any combination of credentials may be configured via environment variables:
 
-Two header forms are accepted, so the server interoperates with both the
-OpenAI client convention and the common "X-API-Key" convention:
+* ``API_KEY``           — accepted via ``Authorization: Bearer <key>``
+                         and ``X-API-Key: <key>`` (programmatic clients).
+* ``UI_USER`` +         — accepted via ``Authorization: Basic <base64(user:pass)>``
+  ``UI_PASSWORD``        (browsers, via the native login dialog).
 
-* ``Authorization: Bearer <key>``   (OpenAI / standard bearer)
-* ``X-API-Key: <key>``              (simple API-key header)
+Auth is **enabled** when at least one credential is configured. When enabled,
+every protected route accepts ANY of the configured credentials:
 
-A request that supplies neither header, or supplies a wrong key, gets a
-``401 Unauthorized`` response matching the OpenAI error shape used elsewhere
-in this server.
+  * If a credential is presented, it is validated against the store that
+    matches its scheme (Bearer/X-API-Key -> API_KEY; Basic -> UI_USER/PASSWORD).
+  * A presented credential with no matching store is invalid (no fallback).
+  * No credential presented -> 401.
+
+When NO credential is configured (local/dev default), authentication is
+DISABLED and all routes are open — existing deployments keep working.
+
+``/health`` is always left unauthenticated (orchestrators/lb probes must
+reach it without credentials).
+
+Comparisons use :func:`hmac.compare_digest` for constant-time equality to
+avoid timing side channels. Error responses use the OpenAI error shape used
+elsewhere in this server.
 """
 
 from __future__ import annotations
 
+import base64
 import hmac
 import logging
 import os
-from typing import Awaitable, Callable, Optional
+from typing import Callable, Optional
 
 from fastapi import Header, HTTPException, status
-from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
 
-# Read once at import time. Empty/whitespace => auth disabled (dev mode).
-_API_KEY: Optional[str] = os.getenv("API_KEY", "").strip() or None
-_AUTH_ENABLED: bool = _API_KEY is not None
+
+def _env(name: str) -> Optional[str]:
+    raw = os.getenv(name, "")
+    raw = raw.strip()
+    return raw or None
+
+
+# --- Credential store (read once at import time) ---------------------------
+_API_KEY: Optional[str] = _env("API_KEY")
+_UI_USER: Optional[str] = _env("UI_USER")
+_UI_PASSWORD: Optional[str] = _env("UI_PASSWORD")
+
+# Basic auth requires BOTH a user and a password to be meaningful.
+_UI_BASIC_ENABLED: bool = _UI_USER is not None and _UI_PASSWORD is not None
+if _UI_USER is not None and not _UI_BASIC_ENABLED:
+    logger.warning(
+        "UI_USER is set but UI_PASSWORD is empty — HTTP Basic auth is "
+        "DISABLED. Set both UI_USER and UI_PASSWORD to enable browser login."
+    )
+
+_AUTH_ENABLED: bool = _API_KEY is not None or _UI_BASIC_ENABLED
 
 if _AUTH_ENABLED:
-    # Avoid logging the key itself; just confirm auth is on.
-    logger.info("API key authentication enabled (API_KEY is set).")
+    enabled_parts = []
+    if _API_KEY is not None:
+        enabled_parts.append("API_KEY (Bearer/X-API-Key)")
+    if _UI_BASIC_ENABLED:
+        enabled_parts.append(f"UI_USER/UI_PASSWORD (Basic, user='{_UI_USER}')")
+    logger.info("Authentication enabled: %s", ", ".join(enabled_parts))
 else:
     logger.warning(
-        "API_KEY is not set — API authentication is DISABLED. "
-        "Set API_KEY to require a bearer/X-API-Key token on all routes."
+        "No credentials configured (API_KEY / UI_USER+UI_PASSWORD) — "
+        "authentication is DISABLED. All routes are open. Set credentials to "
+        "require authentication on all routes except /health."
     )
 
 
 def is_auth_enabled() -> bool:
-    """Return True if API-key authentication is currently enforced."""
+    """Return True if authentication is currently enforced."""
     return _AUTH_ENABLED
 
 
-def _unauthorized(detail: str) -> HTTPException:
+# ---------------------------------------------------------------------------
+# Shared 401 helpers
+# ---------------------------------------------------------------------------
+
+# Advertise all configured schemes so browsers/clients know what to send.
+_CHALLENGE_SCHEMES = []
+if _UI_BASIC_ENABLED:
+    _CHALLENGE_SCHEMES.append('Basic realm="Qwen3-TTS API"')
+if _API_KEY is not None:
+    _CHALLENGE_SCHEMES.append("Bearer")
+_WWW_AUTHENTICATE = ", ".join(_CHALLENGE_SCHEMES) if _CHALLENGE_SCHEMES else None
+
+
+def _unauthorized_exc(detail: str) -> HTTPException:
+    headers = {"WWW-Authenticate": _WWW_AUTHENTICATE} if _WWW_AUTHENTICATE else None
     return HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail={
-            "error": "invalid_api_key",
+            "error": "invalid_credentials",
             "message": detail,
             "type": "invalid_request_error",
         },
-        headers={"WWW-Authenticate": "Bearer"},
+        headers=headers,
     )
 
 
-async def require_api_key(
+def _unauthorized_response(detail: str) -> JSONResponse:
+    headers = {"WWW-Authenticate": _WWW_AUTHENTICATE} if _WWW_AUTHENTICATE else None
+    return JSONResponse(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        content={
+            "error": "invalid_credentials",
+            "message": detail,
+            "type": "invalid_request_error",
+        },
+        headers=headers,
+    )
+
+
+_MISSING_CREDENTIALS_MSG = (
+    "Missing credentials. Authenticate via one of: "
+    "'Authorization: Bearer <api_key>' (when API_KEY is set), "
+    "'X-API-Key: <api_key>' (when API_KEY is set), or "
+    "'Authorization: Basic <base64(user:password)>' (when UI_USER/UI_PASSWORD "
+    "are set)."
+)
+
+
+# ---------------------------------------------------------------------------
+# Credential validation (shared by the FastAPI dependency and the ASGI wrapper)
+# ---------------------------------------------------------------------------
+
+def _eq(a: Optional[str], b: Optional[str]) -> bool:
+    """Constant-time string equality, None-safe."""
+    if a is None or b is None:
+        return False
+    return hmac.compare_digest(a, b)
+
+
+def _validate_authorization_header(value: Optional[str]) -> bool:
+    """Validate an ``Authorization`` header value.
+
+    Handles both ``Bearer <key>`` and ``Basic <base64>`` forms. Returns True
+    if the presented credential is valid against a configured store.
+    """
+    if not value:
+        return False
+    parts = value.split(" ", 1)
+    if len(parts) != 2:
+        return False
+    scheme, payload = parts[0].strip(), parts[1].strip()
+    scheme_l = scheme.lower()
+
+    if scheme_l == "bearer":
+        if _API_KEY is None:
+            return False  # no API key configured -> bearer not accepted
+        return _eq(payload, _API_KEY)
+
+    if scheme_l == "basic":
+        if not _UI_BASIC_ENABLED:
+            return False  # basic not configured -> not accepted
+        try:
+            decoded = base64.b64decode(payload, validate=True).decode("utf-8")
+        except Exception:
+            return False
+        if ":" not in decoded:
+            return False
+        user, _, password = decoded.partition(":")
+        # Validate BOTH user and password to avoid a user-only timing shortcut
+        # that could leak which username is valid.
+        return _eq(user, _UI_USER) and _eq(password, _UI_PASSWORD)
+
+    return False  # unknown scheme
+
+
+def _validate_request(authorization: Optional[str], x_api_key: Optional[str]) -> bool:
+    """Validate a request's credentials from its headers.
+
+    Returns True if any presented credential is valid. A request with no
+    credentials returns False (callers raise 401).
+    """
+    # X-API-Key only applies to the API_KEY store.
+    if x_api_key:
+        if _API_KEY is None:
+            return False
+        return _eq(x_api_key.strip(), _API_KEY)
+
+    if authorization:
+        return _validate_authorization_header(authorization)
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# FastAPI dependency
+# ---------------------------------------------------------------------------
+
+async def require_auth(
     authorization: Optional[str] = Header(default=None),
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
 ) -> None:
-    """FastAPI dependency that enforces a valid API key when auth is enabled.
+    """FastAPI dependency enforcing configured credentials on protected routes.
 
-    Accepts the key from either ``Authorization: Bearer <key>`` or
-    ``X-API-Key: <key>``. Uses :func:`hmac.compare_digest` for constant-time
-    comparison to avoid timing side channels.
-
-    When ``API_KEY`` is unset, this dependency is a no-op (auth disabled).
+    When auth is disabled (no credentials configured), this is a no-op.
+    Otherwise, the request must present a valid credential via
+    ``Authorization: Bearer``, ``Authorization: Basic``, or ``X-API-Key``.
     """
     if not _AUTH_ENABLED:
         return  # Local/dev: open by default.
 
-    provided: Optional[str] = None
+    if _validate_request(authorization, x_api_key):
+        return
 
-    # Prefer an explicit X-API-Key header, then fall back to Bearer.
-    if x_api_key:
-        provided = x_api_key.strip()
-    elif authorization:
-        parts = authorization.split(" ", 1)
-        if len(parts) == 2 and parts[0].lower() == "bearer":
-            provided = parts[1].strip()
+    # Distinguish "no credentials" from "invalid credentials" in the message
+    # without leaking which store matched; both are 401.
+    presented = bool(authorization or x_api_key)
+    detail = (
+        "Invalid credentials." if presented else _MISSING_CREDENTIALS_MSG
+    )
+    raise _unauthorized_exc(detail)
 
-    if not provided:
-        raise _unauthorized(
-            "Missing API key. Provide it via the 'Authorization: Bearer <key>' "
-            "or 'X-API-Key: <key>' header."
-        )
 
-    # Constant-time comparison to avoid timing attacks.
-    if not hmac.compare_digest(provided, _API_KEY):  # type: ignore[arg-type]
-        raise _unauthorized("Invalid API key.")
-
-    return
+# Backward-compatible alias for callers that referenced the previous name.
+require_api_key = require_auth
 
 
 # ---------------------------------------------------------------------------
@@ -105,57 +234,34 @@ async def require_api_key(
 # ---------------------------------------------------------------------------
 # FastAPI/Starlette route-level ``dependencies`` do NOT apply to routes added
 # via ``app.mount(...)`` — mounted ASGI sub-apps bypass the router. To gate
-# static assets (and any other mounted sub-app) behind the same API key, we
-# wrap the sub-app in a tiny ASGI middleware that runs the key check on every
+# static assets (and any other mounted sub-app) behind the same credentials,
+# we wrap the sub-app in a tiny ASGI middleware that runs the check on every
 # request before delegating to the wrapped app.
 
 
-def _unauthorized_response() -> JSONResponse:
-    return JSONResponse(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        content={
-            "error": "invalid_api_key",
-            "message": (
-                "Missing API key. Provide it via the "
-                "'Authorization: Bearer <key>' or 'X-API-Key: <key>' header."
-            ),
-            "type": "invalid_request_error",
-        },
-        headers={"WWW-Authenticate": "Bearer"},
-    )
+def _extract_headers(scope) -> dict:
+    return dict(scope.get("headers") or [])
 
 
-def _extract_key(scope) -> Optional[str]:
-    """Pull the API key from request headers in a raw ASGI scope."""
-    headers = dict(scope.get("headers") or [])
-    # ASGI header keys are lowercased bytes.
+def _validate_scope(scope) -> bool:
+    """Validate credentials from a raw ASGI HTTP scope."""
+    headers = _extract_headers(scope)
     auth = headers.get(b"authorization")
-    if auth:
-        try:
-            auth_s = auth.decode("latin-1")
-        except Exception:
-            return None
-        parts = auth_s.split(" ", 1)
-        if len(parts) == 2 and parts[0].lower() == "bearer":
-            return parts[1].strip()
+    auth_s = auth.decode("latin-1") if auth else None
     x_key = headers.get(b"x-api-key")
-    if x_key:
-        try:
-            return x_key.decode("latin-1").strip()
-        except Exception:
-            return None
-    return None
+    x_key_s = x_key.decode("latin-1") if x_key else None
+    return _validate_request(auth_s, x_key_s)
 
 
 def gated_asgi_app(wrapped_app) -> Callable:
-    """Wrap an ASGI app so every request requires a valid API key when enabled.
+    """Wrap an ASGI app so every HTTP request requires valid credentials.
 
-    Use this to gate ``StaticFiles`` and other mounted sub-applications that
-    bypass FastAPI's route-level ``dependencies``::
+    Use to gate ``StaticFiles`` and other mounted sub-applications that bypass
+    FastAPI's route-level ``dependencies``::
 
         app.mount("/static", gated_asgi_app(StaticFiles(directory=...)))
 
-    When ``API_KEY`` is unset, the wrapper is a pass-through (auth disabled).
+    When auth is disabled, the wrapper is a pass-through.
     """
 
     async def _asgi(scope, receive, send):
@@ -164,12 +270,15 @@ def gated_asgi_app(wrapped_app) -> Callable:
             await wrapped_app(scope, receive, send)
             return
 
-        provided = _extract_key(scope)
-        if not provided or not hmac.compare_digest(provided, _API_KEY):  # type: ignore[arg-type]
-            response = _unauthorized_response()
-            await response(scope, receive, send)
+        if _validate_scope(scope):
+            await wrapped_app(scope, receive, send)
             return
 
-        await wrapped_app(scope, receive, send)
+        presented = bool(
+            (scope.get("headers") and b"authorization" in dict(scope["headers"]))
+            or (b"x-api-key" in dict(scope.get("headers") or []))
+        )
+        detail = "Invalid credentials." if presented else _MISSING_CREDENTIALS_MSG
+        await _unauthorized_response(detail)(scope, receive, send)
 
     return _asgi

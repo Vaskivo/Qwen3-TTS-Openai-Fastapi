@@ -374,6 +374,9 @@ Review device mappings in `docker-compose.rocm.yml`; render-node names vary betw
 | `TTS_MAX_CONCURRENT` | `1` | Concurrent generation limit per process |
 | `TTS_IDLE_TIMEOUT_SECONDS` | `0` | Opt-in idle shutdown; `0` disables it |
 | `CORS_ORIGINS` | `*` | Comma-separated allowed browser origins |
+| `API_KEY` | *(unset)* | When set, requires `Authorization: Bearer <key>` or `X-API-Key: <key>` on all routes except `/health`. Unset = open |
+| `UI_USER` | *(unset)* | Browser UI username (HTTP Basic auth); must be set together with `UI_PASSWORD` |
+| `UI_PASSWORD` | *(unset)* | Browser UI password (HTTP Basic auth); must be set together with `UI_USER` |
 | `ENABLE_VOICE_STUDIO` | `false` | Mount Gradio at `/voice-studio` |
 | `VOICE_LIBRARY_DIR` | `./voice_library` | Saved profile root |
 | `TTS_CUSTOM_VOICES` | `./custom_voices` | Legacy/custom voice directory |
@@ -397,7 +400,66 @@ Invalid float settings fall back to safe defaults instead of crashing module imp
 CORS_ORIGINS=https://app.example.com,https://admin.example.com python -m api.main
 ```
 
-The server does not implement authentication. Put it behind an authenticated reverse proxy or private network before exposing it to the internet. Keep `WORKERS=1` on a single GPU unless you intentionally have enough VRAM for one full model per worker.
+The server has built-in authentication (see [Authentication](#authentication) below) — enable it before exposing the service to the internet. Keep `WORKERS=1` on a single GPU unless you intentionally have enough VRAM for one full model per worker.
+
+## Authentication
+
+By default the server is **open** (no credentials configured) — the same behavior as before, convenient for local and trusted deployments. Configure one or more credentials to require authentication on every route except `/health` (which stays open for orchestrator/load-balancer probes).
+
+You may configure any combination of:
+
+| Variable | Required with | Accepted via |
+|---|---|---|
+| `API_KEY` | — | `Authorization: Bearer <key>` and `X-API-Key: <key>` (programmatic clients) |
+| `UI_USER` + `UI_PASSWORD` | both together | `Authorization: Basic <base64(user:password)>` (browser native login dialog) |
+
+Each credential is **independent** — configure none (open), `API_KEY` only (clients), `UI_USER`+`UI_PASSWORD` only (browser), or both. On every protected request, a presented credential is validated against the store matching its scheme; a credential with no matching configured store is rejected (no fallback), and a request with no credential gets `401`.
+
+### Browser (the web UI)
+
+To log in to `http://127.0.0.1:8880/` (and `/docs`, `/redoc`, `/static/*`) from a browser, set the UI credentials:
+
+```bash
+UI_USER=admin
+UI_PASSWORD=choose-a-password
+```
+
+Browse to `http://127.0.0.1:8880/` → the browser shows its native login dialog → enter `admin` / your password. It caches the credentials for the session, so `/`, `/docs`, and assets all load afterward. The Swagger UI's **Try it out** button is a separate concern: click **Authorize** and paste your `API_KEY` (Bearer) — that authenticates API calls, while the page itself is protected by Basic auth.
+
+### API clients
+
+For programmatic clients (OpenAI SDK, cURL, etc.), set `API_KEY`:
+
+```bash
+API_KEY=$(python -c "import secrets; print(secrets.token_urlsafe(32))")
+```
+
+```bash
+curl http://127.0.0.1:8880/v1/models \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+The OpenAI Python client passes it through with `default_headers={"Authorization": f"Bearer {API_KEY}"}` (or set `X-API-Key`).
+
+### Both at once
+
+For a deployment that humans browse and scripts call, set all three:
+
+```bash
+API_KEY=$(python -c "import secrets; print(secrets.token_urlsafe(32))")
+UI_USER=admin
+UI_PASSWORD=choose-a-password
+```
+
+Browsers use Basic; API clients use Bearer/X-API-Key — each valid on its own.
+
+### Notes
+
+- Comparisons are constant-time (`hmac.compare_digest`) to avoid timing side channels.
+- `401` responses include `WWW-Authenticate` advertising every configured scheme (e.g. `Basic realm="Qwen3-TTS API", Bearer`).
+- `UI_USER` set without `UI_PASSWORD` logs a warning and leaves Basic auth disabled (no silent weakening).
+- `/health` is always unauthenticated.
+- **Voice Studio** (`/voice-studio`) manages its own routing and is not covered by this check; its backend calls to `/v1/*` are still protected. Avoid exposing Voice Studio on an untrusted network.
 
 ## Development and tests
 
