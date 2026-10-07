@@ -417,7 +417,9 @@ class TestFactoryCustomVoiceIntegration:
         mock_backend = MagicMock()
         mock_backend.initialize = AsyncMock()
         mock_backend.load_custom_voices = AsyncMock()
-        mock_backend.is_ready.return_value = True
+        # Not ready: initialize_backend() returns early for ready backends,
+        # skipping initialize() and load_custom_voices() entirely.
+        mock_backend.is_ready.return_value = False
 
         monkeypatch.setattr(factory, "_backend_instance", mock_backend)
 
@@ -426,6 +428,7 @@ class TestFactoryCustomVoiceIntegration:
 
         await factory.initialize_backend(warmup=False)
 
+        mock_backend.initialize.assert_called_once()
         mock_backend.load_custom_voices.assert_called_once()
 
     @pytest.mark.asyncio
@@ -439,6 +442,9 @@ class TestFactoryCustomVoiceIntegration:
         mock_backend = MagicMock()
         mock_backend.initialize = AsyncMock()
         mock_backend.load_custom_voices = AsyncMock()
+        # Not ready: a ready backend short-circuits initialize_backend(),
+        # which would skip the load_custom_voices call under test.
+        mock_backend.is_ready.return_value = False
 
         monkeypatch.setattr(factory, "_backend_instance", mock_backend)
 
@@ -456,11 +462,17 @@ class TestFactoryCustomVoiceIntegration:
         mock_backend.load_custom_voices = AsyncMock(
             side_effect=RuntimeError("boom")
         )
+        # Not ready: a ready backend short-circuits initialize_backend() and
+        # load_custom_voices is never called, making this test pass vacuously.
+        mock_backend.is_ready.return_value = False
 
         monkeypatch.setattr(factory, "_backend_instance", mock_backend)
 
         # Should not raise
         await factory.initialize_backend(warmup=False)
+
+        # The failure path must actually have been exercised.
+        mock_backend.load_custom_voices.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
