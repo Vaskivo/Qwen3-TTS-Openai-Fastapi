@@ -386,6 +386,7 @@ Review device mappings in `docker-compose.rocm.yml`; render-node names vary betw
 | `TTS_CONFIG` | `~/qwen3-tts/config.yaml` | Optimized-backend YAML |
 | `TTS_MODELS_DIR` | *(required)* | Folder of local model snapshots (one subdir per model, repo name without org prefix); models are loaded only from here — no HF cache, no downloads |
 | `GPU_KEEPALIVE_INTERVAL` | `0` | Optional GPU keepalive interval in seconds |
+| `ORT_DISABLE_TELEMETRY` | `1` | Set by default by this project (in `qwen_tts/__init__.py`) to stop onnxruntime >= 1.30's import-time machine fingerprinting and its `:memory:.ses` session-file artifact. Remove the default in `qwen_tts/__init__.py` to re-enable onnxruntime telemetry |
 | `TTS_AUTOCHUNK` | `true` | Enable punctuation-aware input splitting for **non-streaming** requests |
 | `TTS_STREAM_AUTOCHUNK` | `true` | Enable chunking for **streaming** requests (independent of `TTS_AUTOCHUNK`; bounds peak VRAM by giving each chunk its own short-lived KV cache) |
 | `TTS_MIN_CHUNK_CHARS` | `20` | Soft minimum chunk length (shared by both paths) |

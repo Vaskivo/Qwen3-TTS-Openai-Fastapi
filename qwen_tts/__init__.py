@@ -18,6 +18,19 @@
 qwen_tts: Qwen-TTS package.
 """
 
+import os
+
+# onnxruntime >= 1.30 runs built-in platform telemetry at import time:
+# it fingerprints the machine (``sh -c "echo `blkid; hostname`"``) and
+# persists a session/device id as a ``<cwd>/:memory:.ses`` file (a literal
+# ":memory:" storage name that native code appends ".ses" to). This project
+# does not use that telemetry, so disable it by default — before any
+# submodule can import onnxruntime. This file runs before every submodule
+# import, so the flag is always set in time. Remove the variable from the
+# environment here (or set ORT_DISABLE_TELEMETRY explicitly wherever
+# desired) to re-enable onnxruntime's telemetry.
+os.environ.setdefault("ORT_DISABLE_TELEMETRY", "1")
+
 from .inference.qwen3_tts_model import Qwen3TTSModel, VoiceClonePromptItem
 from .inference.qwen3_tts_tokenizer import Qwen3TTSTokenizer
 
