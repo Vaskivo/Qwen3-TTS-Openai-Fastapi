@@ -7,6 +7,7 @@ Implements endpoints compatible with OpenAI's TTS API specification.
 
 import asyncio
 import base64
+import contextlib
 import inspect
 import io
 import json
@@ -51,6 +52,28 @@ except ValueError:
     logger.warning("Invalid TTS_MAX_CONCURRENT value; falling back to 1")
     _MAX_CONCURRENT = 1
 _generation_semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
+
+# --- Streaming robustness (client disconnect / stall handling) -------------
+# A streaming response must never hold the generation slot while blocked on
+# a client that is not reading: uvicorn's write flow-control blocks ``send()``
+# once the socket buffer is full, and a client that stops reading (without
+# closing the connection) would otherwise wedge the slot forever. The
+# producer/consumer core in the streaming-helpers section decouples
+# generation from the client; these bounds make every wait finite:
+#   TTS_STALL_TIMEOUT=10       abort generation when the client has not
+#                              consumed audio for this many seconds (0=never)
+#   TTS_ACQUIRE_TIMEOUT=300    max seconds any request waits for a generation
+#                              slot before failing (503); 0 = wait indefinitely
+#   TTS_STREAM_QUEUE_MAX=32    PCM chunks buffered between the generation
+#                              producer and the client (bounds speculative
+#                              generation ahead of a slow consumer)
+try:
+    _STALL_TIMEOUT = max(0.0, float(os.getenv("TTS_STALL_TIMEOUT", "10")))
+    _ACQUIRE_TIMEOUT = max(0.0, float(os.getenv("TTS_ACQUIRE_TIMEOUT", "300")))
+    _STREAM_QUEUE_MAX = max(1, int(os.getenv("TTS_STREAM_QUEUE_MAX", "32")))
+except ValueError:
+    logger.warning("Invalid streaming-robustness env value; using defaults")
+    _STALL_TIMEOUT, _ACQUIRE_TIMEOUT, _STREAM_QUEUE_MAX = 10.0, 300.0, 32
 
 # --- Auto-chunking -----------------------------------------------------------
 # Input is split at punctuation into chunks sized to a [min, max] character
@@ -616,6 +639,354 @@ def _encode_stream_chunk(
     return b"", wav_header_emitted
 
 
+# ---------------------------------------------------------------------------
+# Generation-slot + producer/consumer streaming core
+# ---------------------------------------------------------------------------
+# Historically the response generator itself acquired ``_generation_semaphore``
+# and yielded to the client *inside* it. When a client stopped reading a
+# stream (without closing the connection), uvicorn's write flow-control
+# blocked ``send()`` forever while the semaphore was still held, wedging every
+# subsequent request (streaming or not) behind it.
+#
+# The fix has two halves:
+#   1. A *producer task* holds the generation slot and drives the backend,
+#      pushing results into a bounded queue. The response generator (the
+#      consumer) only reads from the queue and yields to the client — it
+#      never holds the slot itself.
+#   2. Watchdogs bound how long anything may wait:
+#      - TTS_STALL_TIMEOUT: if the client has not consumed a queued item for
+#        this many seconds, the producer aborts generation and releases the
+#        slot (the stalled response is truncated and dies on its own).
+#      - TTS_ACQUIRE_TIMEOUT: bound how long any request may wait for the
+#        slot before failing (HTTP 503 for non-streaming requests; an SSE
+#        error event / closed stream for streaming ones).
+# The consumer's ``finally`` cancels the producer deterministically when the
+# client disconnects (Starlette cancels the response task), so the slot is
+# released without relying on garbage collection; the stall watchdog is the
+# backstop if teardown is delayed.
+
+
+class _GenerationBusyError(RuntimeError):
+    """Raised when a request waited longer than TTS_ACQUIRE_TIMEOUT for the
+    generation slot (surfaced to streaming consumers as an SSE error)."""
+
+
+class _ClientStalledError(RuntimeError):
+    """Raised inside a producer when the client has not consumed audio for
+    longer than TTS_STALL_TIMEOUT."""
+
+
+async def _acquire_generation_slot(as_http: bool = True) -> None:
+    """Acquire the global generation semaphore, bounded by TTS_ACQUIRE_TIMEOUT.
+
+    Raises HTTPException(503) when *as_http* is true (route handlers), or
+    ``_GenerationBusyError`` (streaming producers, surfaced to the consumer
+    as an SSE error event).
+    """
+    if _ACQUIRE_TIMEOUT <= 0:
+        await _generation_semaphore.acquire()
+        return
+
+    # Run the acquire in its own task so a timeout can never lose a permit:
+    # if the acquire completes in the same instant the timeout fires, the
+    # shield keeps it alive and we hand the permit back explicitly below.
+    # (A plain ``wait_for(semaphore.acquire(), ...)`` can, in a rare race,
+    # leave a granted permit unowned — for a Semaphore(1) that would be a
+    # permanent hang of the very bug class this module guards against.)
+    acq = asyncio.ensure_future(_generation_semaphore.acquire())
+    try:
+        await asyncio.wait_for(asyncio.shield(acq), _ACQUIRE_TIMEOUT)
+        return
+    except asyncio.TimeoutError:
+        acq.cancel()
+        try:
+            await acq
+        except asyncio.CancelledError:
+            if not acq.cancelled():
+                # Our own task is being cancelled; do not swallow it.
+                raise
+        else:
+            # The acquire completed despite the timeout: hand the permit back.
+            _generation_semaphore.release()
+
+    message = (
+        f"The server is busy generating other speech requests; this request "
+        f"waited longer than TTS_ACQUIRE_TIMEOUT={_ACQUIRE_TIMEOUT:.0f}s "
+        f"for a generation slot. Retry shortly."
+    )
+    if as_http:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "server_busy",
+                "message": message,
+                "type": "server_error",
+            },
+            headers={"Retry-After": "5"},
+        )
+    raise _GenerationBusyError(message)
+
+
+@contextlib.asynccontextmanager
+async def _generation_slot(as_http: bool = True):
+    """Acquire the generation slot with guaranteed release.
+
+    Use instead of the raw ``_generation_semaphore`` so that every waiter is
+    bounded by TTS_ACQUIRE_TIMEOUT and every holder always releases.
+    """
+    await _acquire_generation_slot(as_http=as_http)
+    try:
+        yield
+    finally:
+        _generation_semaphore.release()
+
+
+async def _offer(queue, item, label):
+    """Enqueue *item*, aborting with _ClientStalledError if the client has
+    not consumed anything for TTS_STALL_TIMEOUT seconds."""
+    if _STALL_TIMEOUT <= 0:
+        await queue.put(item)
+        return
+    try:
+        await asyncio.wait_for(queue.put(item), timeout=_STALL_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise _ClientStalledError(
+            f"{label}: client stopped consuming the stream for more than "
+            f"{_STALL_TIMEOUT:.1f}s (TTS_STALL_TIMEOUT)"
+        ) from None
+
+
+async def _pcm_stream_producer(source_factory, queue, label):
+    """Producer task: hold the generation slot and drive PCM generation.
+
+    ``source_factory()`` returns an async generator yielding ``(pcm_chunk,
+    sample_rate)`` tuples; each is offered to *queue*, consumed by the
+    response generator built by ``_stream_from_producer``. Terminal items:
+    ``("done", None)`` on success, ``("error", exc)`` on failure. If the
+    client stalls, the producer exits *without* a terminal item — the
+    consumer detects that via producer completion and truncates the stream.
+    """
+    try:
+        async with _generation_slot(as_http=False):
+            async for pcm_chunk, sr in source_factory():
+                await _offer(queue, ("chunk", (pcm_chunk, sr)), label)
+            await _offer(queue, ("done", None), label)
+    except _ClientStalledError as exc:
+        logger.warning("%s: aborting generation (%s)", label, exc)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        # Surface the failure to the consumer if it is still listening; if
+        # the queue is full (stalled client) the drop is harmless — the
+        # consumer stops as soon as it sees the producer has exited.
+        try:
+            queue.put_nowait(("error", exc))
+        except asyncio.QueueFull:
+            pass
+
+
+async def _encoded_stream_producer(make_blob, queue, label):
+    """Producer task for compressed formats: hold the generation slot, drain
+    and encode the audio once, then enqueue a single blob item.
+
+    ``make_blob()`` is an awaitable returning ``(audio_bytes, sample_rate,
+    total_samples)``; the consumer byte-chunks it into the response.
+    """
+    try:
+        async with _generation_slot(as_http=False):
+            blob = await make_blob()
+            await _offer(queue, ("blob", blob), label)
+            await _offer(queue, ("done", None), label)
+    except _ClientStalledError as exc:
+        logger.warning("%s: aborting generation (%s)", label, exc)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        try:
+            queue.put_nowait(("error", exc))
+        except asyncio.QueueFull:
+            pass
+
+
+async def _next_stream_item(queue, producer):
+    """Await the next item from *queue*, racing against producer completion.
+
+    Returns the ``(kind, payload)`` item, or ``None`` when the producer has
+    exited and the queue is empty (aborted generation: stalled or
+    disconnected client). Never blocks forever: either an item, the
+    producer's exit, or the caller's own cancellation resumes this await.
+    """
+    getter = asyncio.ensure_future(queue.get())
+    try:
+        await asyncio.wait({getter, producer}, return_when=asyncio.FIRST_COMPLETED)
+        if getter.done():
+            return getter.result()
+        # The producer exited first. A terminal item may still have raced
+        # into the queue, so give the getter one last chance to complete
+        # instead of dropping a queued item.
+        getter.cancel()
+        try:
+            return await getter
+        except asyncio.CancelledError:
+            if getter.cancelled():
+                return None
+            raise  # our own cancellation; propagate
+    except BaseException:
+        if not getter.done():
+            getter.cancel()
+        raise
+
+
+def _stream_from_producer(make_producer, fmt, is_sse, client_request, label):
+    """Build the StreamingResponse body generator for a decoupled producer.
+
+    ``make_producer(queue)`` builds the producer coroutine (one of the
+    ``*_stream_producer`` helpers above). The consumer yields SSE events
+    (``is_sse``) or raw/encoded audio bytes, and *always* cancels the producer
+    in ``finally`` — this is what guarantees the generation slot is released
+    when Starlette tears the response down after a client disconnect, without
+    depending on garbage collection.
+    """
+
+    async def _stream():
+        gen_start = time.time()
+        first_chunk_logged = False
+        total_samples = 0
+        chunk_count = 0
+        sample_rate = 24000
+        wav_header_emitted = False
+        queue: asyncio.Queue = asyncio.Queue(maxsize=_STREAM_QUEUE_MAX)
+        producer = asyncio.ensure_future(make_producer(queue))
+        failed: Optional[BaseException] = None
+        aborted = False
+        try:
+            while True:
+                item = await _next_stream_item(queue, producer)
+                if item is None:
+                    aborted = True
+                    logger.warning(
+                        "%s: generation aborted before completion (client "
+                        "stalled or disconnected); truncating the stream",
+                        label,
+                    )
+                    break
+                kind, payload = item
+                if kind == "chunk":
+                    pcm_chunk, sr = payload
+                    if pcm_chunk is None or len(pcm_chunk) == 0:
+                        continue
+                    if not first_chunk_logged:
+                        logger.info(
+                            f"{label} TTFB: {time.time()-gen_start:.3f}s"
+                        )
+                        first_chunk_logged = True
+                    total_samples += len(pcm_chunk)
+                    sample_rate = sr
+                    chunk_count += 1
+                    if is_sse:
+                        pcm = pcm_bytes_from_chunk(pcm_chunk)
+                        yield _sse_event("speech.audio.delta", {
+                            "type": "speech.audio.delta",
+                            "audio": base64.b64encode(pcm).decode("ascii"),
+                            "response_format": fmt,
+                        })
+                    else:
+                        chunk_bytes, wav_header_emitted = _encode_stream_chunk(
+                            pcm_chunk, fmt, sr, wav_header_emitted
+                        )
+                        if chunk_bytes:
+                            yield chunk_bytes
+                    await asyncio.sleep(0)
+                elif kind == "blob":
+                    audio_bytes, sr, samples = payload
+                    sample_rate = sr
+                    total_samples = samples
+                    chunk_count = 1
+                    if not first_chunk_logged:
+                        logger.info(
+                            f"{label} TTFB: {time.time()-gen_start:.3f}s"
+                        )
+                        first_chunk_logged = True
+                    if is_sse:
+                        for slc in iter_encoded_bytes(audio_bytes):
+                            yield _sse_event("speech.audio.delta", {
+                                "type": "speech.audio.delta",
+                                "audio": base64.b64encode(slc).decode("ascii"),
+                                "response_format": fmt,
+                            })
+                    else:
+                        for slc in iter_encoded_bytes(audio_bytes):
+                            yield slc
+                elif kind == "done":
+                    break
+                else:  # ("error", exc)
+                    failed = payload
+                    if is_sse:
+                        busy = isinstance(payload, _GenerationBusyError)
+                        yield _sse_event("speech.audio.error", {
+                            "type": "speech.audio.error",
+                            "error": {
+                                "message": str(payload),
+                                "type": "server_busy" if busy else "server_error",
+                                "param": None,
+                                "code": 503 if busy else 500,
+                            },
+                        })
+                    break
+            if failed is None and not aborted:
+                if is_sse:
+                    yield _sse_event("speech.audio.done", {
+                        "type": "speech.audio.done",
+                        "usage": {
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "total_tokens": 0,
+                        },
+                    })
+                gen_time = time.time() - gen_start
+                audio_dur = total_samples / sample_rate if sample_rate > 0 else 0
+                rtf = gen_time / audio_dur if audio_dur > 0 else 0
+                logger.info(
+                    f"{label} done: total={gen_time:.2f}s "
+                    f"audio={audio_dur:.2f}s RTF={rtf:.2f}x chunks={chunk_count}"
+                )
+                try:
+                    note_speech_activity(client_request.app, samples=total_samples)
+                except Exception:
+                    pass
+        except Exception as exc:
+            # Consumer-side failures (encoding etc.); producer-side errors
+            # arrive as ("error", ...) items instead.
+            logger.error(f"{label} error: {exc}")
+            if is_sse:
+                yield _sse_event("speech.audio.error", {
+                    "type": "speech.audio.error",
+                    "error": {
+                        "message": str(exc),
+                        "type": "server_error",
+                        "param": None,
+                        "code": 500,
+                    },
+                })
+            raise
+        finally:
+            # Deterministic producer teardown: runs on normal completion, on
+            # client disconnect (Starlette cancels the response / GC closes the
+            # generator), and on error paths — releasing the generation slot
+            # promptly in all of them.
+            producer.cancel()
+            try:
+                await producer
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.error(f"{label} producer failed: {exc}")
+        if failed is not None:
+            raise failed
+
+    return _stream()
+
+
 async def _drain_and_encode(
     gen, fmt: str, default_sr: int
 ) -> tuple:
@@ -922,129 +1293,65 @@ async def create_speech(
                         text=text, **clone_stream_kwargs,
                     )
 
-                async def _clone_stream():
-                    gen_start = time.time()
-                    first_chunk_logged = False
-                    total_samples = 0
-                    chunk_count = 0
-                    sample_rate = 24000
-                    wav_header_emitted = False
-                    try:
-                        if fmt in ("pcm", "wav"):
-                            async with _generation_semaphore:
-                                # Source: single-call (today) or chunked driver.
-                                if len(stream_chunks) <= 1:
-                                    logger.debug(
-                                        "TTS clone stream single chunk (no gaps): %r",
-                                        normalized_text,
-                                    )
-                                    source = backend.generate_voice_clone_streaming(
-                                        **clone_stream_kwargs, text=normalized_text,
-                                    )
-                                else:
-                                    source = _chunked_stream_drain(
-                                        stream_chunks, _clone_make_gen, fmt, 24000,
-                                    )
-                                async for pcm_chunk, sr in source:
-                                    if pcm_chunk is None or len(pcm_chunk) == 0:
-                                        continue
-                                    if not first_chunk_logged:
-                                        logger.info(
-                                            f"Voice clone stream TTFB: "
-                                            f"{time.time()-gen_start:.3f}s"
-                                        )
-                                        first_chunk_logged = True
-                                    total_samples += len(pcm_chunk)
-                                    sample_rate = sr
-                                    chunk_count += 1
-                                    if is_sse:
-                                        payload = pcm_bytes_from_chunk(pcm_chunk)
-                                        yield _sse_event("speech.audio.delta", {
-                                            "type": "speech.audio.delta",
-                                            "audio": base64.b64encode(payload).decode("ascii"),
-                                            "response_format": fmt,
-                                        })
-                                    else:
-                                        chunk_bytes, wav_header_emitted = _encode_stream_chunk(
-                                            pcm_chunk, fmt, sr, wav_header_emitted
-                                        )
-                                        if chunk_bytes:
-                                            yield chunk_bytes
-                                    await asyncio.sleep(0)
-                        else:
-                            # Compressed: drain all PCM (one chunk or many),
-                            # encode ONCE, then byte-chunk. Multi-chunk must
-                            # accumulate across chunks to avoid N container headers.
-                            async with _generation_semaphore:
-                                if len(stream_chunks) <= 1:
-                                    audio_bytes, sample_rate, total_samples = await _drain_and_encode(
-                                        backend.generate_voice_clone_streaming(
-                                            **clone_stream_kwargs, text=normalized_text,
-                                        ),
-                                        fmt,
-                                        24000,
-                                    )
-                                else:
-                                    audio_np = None
-                                    async for pcm_chunk, sr in _chunked_stream_drain(
-                                        stream_chunks, _clone_make_gen, fmt, 24000,
-                                    ):
-                                        audio_np = pcm_chunk
-                                        sample_rate = sr
-                                    if audio_np is None:
-                                        raise RuntimeError("no audio produced from any chunk")
-                                    total_samples = len(audio_np)
-                                    audio_bytes = await asyncio.to_thread(
-                                        encode_audio, audio_np, fmt, sample_rate
-                                    )
-                                chunk_count = 1
-                            if is_sse:
-                                for slc in iter_encoded_bytes(audio_bytes):
-                                    yield _sse_event("speech.audio.delta", {
-                                        "type": "speech.audio.delta",
-                                        "audio": base64.b64encode(slc).decode("ascii"),
-                                        "response_format": fmt,
-                                    })
-                            else:
-                                for slc in iter_encoded_bytes(audio_bytes):
-                                    yield slc
-                        if is_sse:
-                            yield _sse_event("speech.audio.done", {
-                                "type": "speech.audio.done",
-                                "usage": {
-                                    "input_tokens": 0,
-                                    "output_tokens": 0,
-                                    "total_tokens": 0,
-                                },
-                            })
-                        gen_time = time.time() - gen_start
-                        audio_dur = total_samples / sample_rate if sample_rate > 0 else 0
-                        rtf = gen_time / audio_dur if audio_dur > 0 else 0
-                        logger.info(
-                            f"Voice clone stream done: "
-                            f"total={gen_time:.2f}s audio={audio_dur:.2f}s "
-                            f"RTF={rtf:.2f}x chunks={chunk_count}"
+                if fmt in ("pcm", "wav"):
+                    # Source: single-call (today) or chunked driver.
+                    if len(stream_chunks) <= 1:
+                        logger.debug(
+                            "TTS clone stream single chunk (no gaps): %r",
+                            normalized_text,
                         )
-                        try:
-                            note_speech_activity(client_request.app, samples=total_samples)
-                        except Exception:
-                            pass
-                    except Exception as exc:
-                        logger.error(f"Voice clone stream error: {exc}")
-                        if is_sse:
-                            yield _sse_event("speech.audio.error", {
-                                "type": "speech.audio.error",
-                                "error": {
-                                    "message": str(exc),
-                                    "type": "server_error",
-                                    "param": None,
-                                    "code": 500,
-                                },
-                            })
-                        raise
+
+                        def _clone_source():
+                            return backend.generate_voice_clone_streaming(
+                                **clone_stream_kwargs, text=normalized_text,
+                            )
+                    else:
+                        def _clone_source():
+                            return _chunked_stream_drain(
+                                stream_chunks, _clone_make_gen, fmt, 24000,
+                            )
+
+                    def _clone_producer(queue):
+                        return _pcm_stream_producer(
+                            _clone_source, queue, "Voice clone stream",
+                        )
+                else:
+                    # Compressed: drain all PCM (one chunk or many),
+                    # encode ONCE, then byte-chunk. Multi-chunk must
+                    # accumulate across chunks to avoid N container headers.
+                    async def _clone_blob():
+                        if len(stream_chunks) <= 1:
+                            return await _drain_and_encode(
+                                backend.generate_voice_clone_streaming(
+                                    **clone_stream_kwargs, text=normalized_text,
+                                ),
+                                fmt,
+                                24000,
+                            )
+                        audio_np = None
+                        sr = 24000
+                        async for pcm_chunk, chunk_sr in _chunked_stream_drain(
+                            stream_chunks, _clone_make_gen, fmt, 24000,
+                        ):
+                            audio_np = pcm_chunk
+                            sr = chunk_sr
+                        if audio_np is None:
+                            raise RuntimeError("no audio produced from any chunk")
+                        audio_bytes = await asyncio.to_thread(
+                            encode_audio, audio_np, fmt, sr
+                        )
+                        return audio_bytes, sr, len(audio_np)
+
+                    def _clone_producer(queue):
+                        return _encoded_stream_producer(
+                            _clone_blob, queue, "Voice clone stream",
+                        )
 
                 return StreamingResponse(
-                    _clone_stream(),
+                    _stream_from_producer(
+                        _clone_producer, fmt, is_sse, client_request,
+                        "Voice clone stream",
+                    ),
                     media_type=content_type,
                     headers=_stream_headers(fmt, request.stream_format),
                 )
@@ -1085,7 +1392,7 @@ async def create_speech(
                     logger.debug(
                         "TTS clone single chunk (no gaps): %r", seg,
                     )
-                    async with _generation_semaphore:
+                    async with _generation_slot():
                         audio, sample_rate = await _clone_synth(seg)
                 else:
                     logger.info(
@@ -1096,7 +1403,7 @@ async def create_speech(
                     )
                     audios: List[np.ndarray] = []
                     sample_rate = 24000
-                    async with _generation_semaphore:
+                    async with _generation_slot():
                         for chunk in chunks:
                             a, sr = await _clone_synth(chunk.text)
                             if a is not None and len(a):
@@ -1194,179 +1501,102 @@ async def create_speech(
 
             if hasattr(backend, "generate_speech_streaming"):
                 # Optimized backend: real incremental PCM generation.
-                async def _speech_stream():
-                    gen_start = time.time()
-                    first_chunk_logged = False
-                    total_samples = 0
-                    chunk_count = 0
-                    sample_rate = 24000
-                    wav_header_emitted = False
-                    try:
-                        if fmt in ("pcm", "wav"):
-                            async with _generation_semaphore:
-                                # Source: single-call (today) or chunked driver.
-                                if len(stream_chunks) <= 1:
-                                    logger.debug(
-                                        "TTS stream single chunk (no gaps): %r",
-                                        normalized_text,
-                                    )
-                                    source = backend.generate_speech_streaming(
-                                        text=normalized_text,
-                                        voice=voice_name,
-                                        language=language,
-                                        instruct=request.instructions,
-                                        model=request.model,
-                                    )
-                                else:
-                                    source = _chunked_stream_drain(
-                                        stream_chunks, _speech_make_gen, fmt, 24000,
-                                    )
-                                async for pcm_chunk, sr in source:
-                                    if pcm_chunk is None or len(pcm_chunk) == 0:
-                                        continue
-                                    if not first_chunk_logged:
-                                        logger.info(
-                                            f"TTS stream TTFB: "
-                                            f"{time.time()-gen_start:.3f}s"
-                                        )
-                                        first_chunk_logged = True
-                                    total_samples += len(pcm_chunk)
-                                    sample_rate = sr
-                                    chunk_count += 1
-                                    if is_sse:
-                                        payload = pcm_bytes_from_chunk(pcm_chunk)
-                                        yield _sse_event("speech.audio.delta", {
-                                            "type": "speech.audio.delta",
-                                            "audio": base64.b64encode(payload).decode("ascii"),
-                                            "response_format": fmt,
-                                        })
-                                    else:
-                                        chunk_bytes, wav_header_emitted = _encode_stream_chunk(
-                                            pcm_chunk, fmt, sr, wav_header_emitted
-                                        )
-                                        if chunk_bytes:
-                                            yield chunk_bytes
-                                    await asyncio.sleep(0)
-                        else:
-                            # Compressed: drain all PCM (one chunk or many),
-                            # encode ONCE, then byte-chunk. Multi-chunk must
-                            # accumulate across chunks to avoid N container headers.
-                            async with _generation_semaphore:
-                                if len(stream_chunks) <= 1:
-                                    audio_bytes, sample_rate, total_samples = await _drain_and_encode(
-                                        backend.generate_speech_streaming(
-                                            text=normalized_text,
-                                            voice=voice_name,
-                                            language=language,
-                                            instruct=request.instructions,
-                                            model=request.model,
-                                        ),
-                                        fmt,
-                                        24000,
-                                    )
-                                else:
-                                    audio_np = None
-                                    async for pcm_chunk, sr in _chunked_stream_drain(
-                                        stream_chunks, _speech_make_gen, fmt, 24000,
-                                    ):
-                                        audio_np = pcm_chunk
-                                        sample_rate = sr
-                                    if audio_np is None:
-                                        raise RuntimeError("no audio produced from any chunk")
-                                    total_samples = len(audio_np)
-                                    audio_bytes = await asyncio.to_thread(
-                                        encode_audio, audio_np, fmt, sample_rate
-                                    )
-                                chunk_count = 1
-                            if is_sse:
-                                for slc in iter_encoded_bytes(audio_bytes):
-                                    yield _sse_event("speech.audio.delta", {
-                                        "type": "speech.audio.delta",
-                                        "audio": base64.b64encode(slc).decode("ascii"),
-                                        "response_format": fmt,
-                                    })
-                            else:
-                                for slc in iter_encoded_bytes(audio_bytes):
-                                    yield slc
-                        if is_sse:
-                            yield _sse_event("speech.audio.done", {
-                                "type": "speech.audio.done",
-                                "usage": {
-                                    "input_tokens": 0,
-                                    "output_tokens": 0,
-                                    "total_tokens": 0,
-                                },
-                            })
-                        gen_time = time.time() - gen_start
-                        audio_dur = total_samples / sample_rate if sample_rate > 0 else 0
-                        rtf = gen_time / audio_dur if audio_dur > 0 else 0
-                        logger.info(
-                            f"TTS stream done: total={gen_time:.2f}s "
-                            f"audio={audio_dur:.2f}s RTF={rtf:.2f}x chunks={chunk_count}"
+                if fmt in ("pcm", "wav"):
+                    # Source: single-call (today) or chunked driver.
+                    if len(stream_chunks) <= 1:
+                        logger.debug(
+                            "TTS stream single chunk (no gaps): %r",
+                            normalized_text,
                         )
-                        try:
-                            note_speech_activity(client_request.app, samples=total_samples)
-                        except Exception:
-                            pass
-                    except Exception as exc:
-                        logger.error(f"TTS stream error: {exc}")
-                        if is_sse:
-                            yield _sse_event("speech.audio.error", {
-                                "type": "speech.audio.error",
-                                "error": {
-                                    "message": str(exc),
-                                    "type": "server_error",
-                                    "param": None,
-                                    "code": 500,
-                                },
-                            })
-                        raise
+
+                        def _speech_source():
+                            return backend.generate_speech_streaming(
+                                text=normalized_text,
+                                voice=voice_name,
+                                language=language,
+                                instruct=request.instructions,
+                                model=request.model,
+                            )
+                    else:
+                        def _speech_source():
+                            return _chunked_stream_drain(
+                                stream_chunks, _speech_make_gen, fmt, 24000,
+                            )
+
+                    def _speech_producer(queue):
+                        return _pcm_stream_producer(
+                            _speech_source, queue, "TTS stream",
+                        )
+                else:
+                    # Compressed: drain all PCM (one chunk or many),
+                    # encode ONCE, then byte-chunk. Multi-chunk must
+                    # accumulate across chunks to avoid N container headers.
+                    async def _speech_blob():
+                        if len(stream_chunks) <= 1:
+                            return await _drain_and_encode(
+                                backend.generate_speech_streaming(
+                                    text=normalized_text,
+                                    voice=voice_name,
+                                    language=language,
+                                    instruct=request.instructions,
+                                    model=request.model,
+                                ),
+                                fmt,
+                                24000,
+                            )
+                        audio_np = None
+                        sr = 24000
+                        async for pcm_chunk, chunk_sr in _chunked_stream_drain(
+                            stream_chunks, _speech_make_gen, fmt, 24000,
+                        ):
+                            audio_np = pcm_chunk
+                            sr = chunk_sr
+                        if audio_np is None:
+                            raise RuntimeError("no audio produced from any chunk")
+                        audio_bytes = await asyncio.to_thread(
+                            encode_audio, audio_np, fmt, sr
+                        )
+                        return audio_bytes, sr, len(audio_np)
+
+                    def _speech_producer(queue):
+                        return _encoded_stream_producer(
+                            _speech_blob, queue, "TTS stream",
+                        )
 
                 return StreamingResponse(
-                    _speech_stream(),
+                    _stream_from_producer(
+                        _speech_producer, fmt, is_sse, client_request,
+                        "TTS stream",
+                    ),
                     media_type=content_type,
                     headers=_stream_headers(fmt, request.stream_format),
                 )
             else:
                 # Backend without a streaming generator: drain-then-chunk so the
                 # streaming envelope/Content-Type still matches the request.
-                async def _fallback_stream():
-                    async with _generation_semaphore:
-                        audio, sample_rate = await generate_speech(
-                            text=normalized_text,
-                            voice=request.voice,
-                            language=language,
-                            instruct=request.instructions,
-                            speed=1.0,
-                        )
-                    try:
-                        note_speech_activity(client_request.app, samples=len(audio))
-                    except Exception:
-                        pass
+                async def _fallback_blob():
+                    audio, sample_rate = await generate_speech(
+                        text=normalized_text,
+                        voice=request.voice,
+                        language=language,
+                        instruct=request.instructions,
+                        speed=1.0,
+                    )
                     audio_bytes = await asyncio.to_thread(
                         encode_audio, audio, fmt, sample_rate
                     )
-                    if is_sse:
-                        for slc in iter_encoded_bytes(audio_bytes):
-                            yield _sse_event("speech.audio.delta", {
-                                "type": "speech.audio.delta",
-                                "audio": base64.b64encode(slc).decode("ascii"),
-                                "response_format": fmt,
-                            })
-                        yield _sse_event("speech.audio.done", {
-                            "type": "speech.audio.done",
-                            "usage": {
-                                "input_tokens": 0,
-                                "output_tokens": 0,
-                                "total_tokens": 0,
-                            },
-                        })
-                    else:
-                        for slc in iter_encoded_bytes(audio_bytes):
-                            yield slc
+                    return audio_bytes, sample_rate, len(audio)
+
+                def _fallback_producer(queue):
+                    return _encoded_stream_producer(
+                        _fallback_blob, queue, "TTS stream",
+                    )
 
                 return StreamingResponse(
-                    _fallback_stream(),
+                    _stream_from_producer(
+                        _fallback_producer, fmt, is_sse, client_request,
+                        "TTS stream",
+                    ),
                     media_type=content_type,
                     headers=_stream_headers(fmt, request.stream_format),
                 )
@@ -1375,7 +1605,7 @@ async def create_speech(
         # Non-streaming: full audio in a single response
         # ----------------------------------------------------------------
         # Guard against concurrent overload
-        async with _generation_semaphore:
+        async with _generation_slot():
             # Generate speech
             audio, sample_rate = await generate_speech(
                 text=normalized_text,
@@ -1679,7 +1909,7 @@ async def create_voice_clone(
             )
 
         # Generate voice clone
-        async with _generation_semaphore:
+        async with _generation_slot():
             audio, sample_rate = await backend.generate_voice_clone(
                 text=normalized_text,
                 ref_audio=ref_audio,

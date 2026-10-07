@@ -28,6 +28,11 @@ uv.lock
 .env
 .devcontainer
 
+# Runtime artifacts
+# sqlite file accidentally created on disk when a literal ":memory:" path
+# is passed through the voice-library profile store
+:memory:.ses
+
 # Audio output files
 output/
 *.wav

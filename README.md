@@ -372,6 +372,9 @@ Review device mappings in `docker-compose.rocm.yml`; render-node names vary betw
 | `TTS_WARMUP_ON_START` | `false` | Warm regular and supported streaming paths |
 | `TTS_WARMUP_MAX_SECONDS` | `10` | Timeout per warmup request |
 | `TTS_MAX_CONCURRENT` | `1` | Concurrent generation limit per process |
+| `TTS_STALL_TIMEOUT` | `10` | Abort a streaming generation when the client has not consumed audio for this many seconds (releases the generation slot so other requests are not blocked behind a stalled stream); `0` disables the watchdog |
+| `TTS_ACQUIRE_TIMEOUT` | `300` | Max seconds a request waits for a generation slot before failing (HTTP 503 / SSE error); `0` waits indefinitely |
+| `TTS_STREAM_QUEUE_MAX` | `32` | PCM chunks buffered between generation and the client (bounds speculative generation ahead of a slow consumer) |
 | `TTS_IDLE_TIMEOUT_SECONDS` | `0` | Opt-in idle shutdown; `0` disables it |
 | `CORS_ORIGINS` | `*` | Comma-separated allowed browser origins |
 | `API_KEY` | *(unset)* | When set, requires `Authorization: Bearer <key>` or `X-API-Key: <key>` on all routes except `/health`. Unset = open |
