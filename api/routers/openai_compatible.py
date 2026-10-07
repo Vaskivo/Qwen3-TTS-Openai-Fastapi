@@ -741,6 +741,12 @@ async def _generation_slot(as_http: bool = True):
         _generation_semaphore.release()
 
 
+# Public alias: used by the idle-unload watchdog (api.main) and the manual
+# unload endpoint to guarantee that no generation is in flight while the
+# model is being unloaded from VRAM.
+generation_slot = _generation_slot
+
+
 async def _offer(queue, item, label):
     """Enqueue *item*, aborting with _ClientStalledError if the client has
     not consumed anything for TTS_STALL_TIMEOUT seconds."""
@@ -1947,4 +1953,52 @@ async def create_voice_clone(
                 "message": str(e),
                 "type": "server_error",
             },
+        )
+
+
+@router.post("/audio/unload")
+async def unload_model(client_request: Request):
+    """Unload the model from VRAM on demand.
+
+    Intended for home-automation scripts: after a known burst of usage the
+    model (and cached GPU resources) can be released immediately instead of
+    waiting for the idle-unload timeout (TTS_IDLE_UNLOAD_SECONDS). The server
+    keeps running; the next speech request re-loads the model. Safe to call
+    when the model is not loaded.
+
+    Reports one of:
+    - ``unloaded``:        a loaded model was released
+    - ``already_unloaded``: nothing was resident in VRAM
+    - ``busy`` (HTTP 503): a generation is in flight; retry shortly
+    """
+    from fastapi.responses import JSONResponse
+
+    from ..backends import unload_backend
+
+    try:
+        async with generation_slot(as_http=False):
+            if await unload_backend():
+                client_request.app.state.backend_unloaded = True
+                logger.info("Manual unload: model released from VRAM")
+                return {
+                    "status": "unloaded",
+                    "message": (
+                        "Model unloaded; VRAM released. "
+                        "The next speech request re-loads it."
+                    ),
+                }
+            return {
+                "status": "already_unloaded",
+                "message": "No model is currently loaded.",
+            }
+    except _GenerationBusyError:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "busy",
+                "message": (
+                    "A speech generation is in progress; retry shortly."
+                ),
+            },
+            headers={"Retry-After": "5"},
         )

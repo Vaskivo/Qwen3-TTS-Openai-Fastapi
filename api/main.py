@@ -13,7 +13,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -87,6 +87,10 @@ TTS_BACKEND = os.getenv("TTS_BACKEND", "official").strip().lower() or "official"
 TTS_WARMUP_ON_START = _env_bool("TTS_WARMUP_ON_START", False)
 GPU_KEEPALIVE_INTERVAL = _env_int("GPU_KEEPALIVE_INTERVAL", 0, minimum=0)
 TTS_LAZY_LOAD = _env_bool("TTS_LAZY_LOAD", True)
+# Release the model from VRAM after this many seconds without a successful
+# speech request (the server keeps running; the next request re-loads it).
+# 0 disables the watchdog. Home servers usually want this enabled.
+TTS_IDLE_UNLOAD_SECONDS = _env_int("TTS_IDLE_UNLOAD_SECONDS", 600, minimum=0)
 # Production servers must not unexpectedly terminate after being idle. Opt in
 # explicitly on workstation deployments that benefit from releasing RAM/VRAM.
 TTS_IDLE_TIMEOUT_SECONDS = _env_int("TTS_IDLE_TIMEOUT_SECONDS", 0, minimum=0)
@@ -154,6 +158,72 @@ async def lifespan(app: FastAPI):
     app.state.speech_request_count = 0
     app.state.speech_total_samples = 0
 
+    idle_unload_task: asyncio.Task | None = None
+    app.state.backend_unloaded = False
+    if TTS_IDLE_UNLOAD_SECONDS > 0:
+
+        async def _idle_unload_watchdog() -> None:
+            """Unload the model after TTS_IDLE_UNLOAD_SECONDS without speech.
+
+            Only successful speech requests reset the timer (read-only
+            endpoints like /health do not). Before unloading we take the
+            router's generation slot so no generation can be in flight, then
+            re-check the timer (a request may have completed meanwhile). The
+            next speech request re-loads the model through the normal lazy
+            path (get_tts_backend → initialize_backend).
+            """
+            from .backends import get_backend, unload_backend
+            from .routers.openai_compatible import (
+                _GenerationBusyError,
+                generation_slot,
+            )
+
+            while True:
+                since_last = time.monotonic() - app.state.last_speech_at
+                if since_last < TTS_IDLE_UNLOAD_SECONDS:
+                    await asyncio.sleep(1 if since_last < 60 else 30)
+                    continue
+
+                try:
+                    backend = get_backend()
+                except Exception:
+                    backend = None
+                if backend is None or not backend.is_ready():
+                    # Nothing resident in VRAM (never used, or already
+                    # unloaded): poll slowly.
+                    await asyncio.sleep(30)
+                    continue
+
+                try:
+                    async with generation_slot(as_http=False):
+                        # Re-check: a request may have finished while we
+                        # waited for the slot.
+                        since_last = time.monotonic() - app.state.last_speech_at
+                        if since_last < TTS_IDLE_UNLOAD_SECONDS:
+                            continue
+                        if await unload_backend():
+                            app.state.backend_unloaded = True
+                            logger.info(
+                                "No successful speech request for %.0fs; "
+                                "model unloaded to free VRAM "
+                                "(next request re-loads it)",
+                                since_last,
+                            )
+                except _GenerationBusyError:
+                    # A generation holds the slot; retry later.
+                    pass
+                await asyncio.sleep(30)
+
+        idle_unload_task = asyncio.create_task(
+            _idle_unload_watchdog(), name="idle-unload"
+        )
+        logger.info(
+            "Idle unload enabled: model is released from VRAM after %ds "
+            "without a successful speech request "
+            "(set TTS_IDLE_UNLOAD_SECONDS=0 to disable)",
+            TTS_IDLE_UNLOAD_SECONDS,
+        )
+
     if TTS_IDLE_TIMEOUT_SECONDS > 0:
 
         async def _idle_watchdog() -> None:
@@ -180,6 +250,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await _cancel_task(keepalive_task)
+        await _cancel_task(idle_unload_task)
         await _cancel_task(idle_shutdown_task)
         logger.info("Server shutdown complete")
 
@@ -291,15 +362,23 @@ async def root():
 
 
 @app.get("/health")
-async def health_check():
+async def health_check(request: Request):
     try:
         from .backends import get_backend
 
         backend = get_backend()
         device_info = backend.get_device_info()
         ready = backend.is_ready()
+        if ready:
+            status = "healthy"
+        elif getattr(request.app.state, "backend_unloaded", False):
+            # Model was released from VRAM by the idle-unload watchdog or the
+            # manual unload endpoint; it reloads on the next speech request.
+            status = "unloaded"
+        else:
+            status = "initializing"
         return {
-            "status": "healthy" if ready else "initializing",
+            "status": status,
             "backend": {
                 "name": backend.get_backend_name(),
                 "model_id": backend.get_model_id(),

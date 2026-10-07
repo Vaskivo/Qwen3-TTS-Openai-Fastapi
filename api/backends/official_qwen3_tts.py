@@ -54,6 +54,11 @@ class OfficialQwen3TTSBackend(TTSBackend):
         self.model_name = model_name
         self._ready = False
         self._voice_design_model_id: Optional[str] = self._read_voice_design_model_id()
+        # Remembered so a re-initialize (e.g. after an idle unload) can reload
+        # the custom voices without the factory calling load_custom_voices
+        # again (e.g. when generation self-heals inside the backend).
+        self._custom_voices_dir: Optional[str] = None
+        self._custom_voices_loaded = False
 
     @staticmethod
     def _read_voice_design_model_id() -> Optional[str]:
@@ -194,10 +199,48 @@ class OfficialQwen3TTSBackend(TTSBackend):
             
             self._ready = True
             logger.info(f"Official Qwen3-TTS backend loaded successfully on {self.device}")
+
+            # Re-initialization after an idle unload: the unload also cleared
+            # the custom voices (their cached prompts are GPU tensors), so load
+            # them back from their on-disk cache. On a fresh start this is a
+            # no-op (the factory calls load_custom_voices separately).
+            if self._custom_voices_loaded and self._custom_voices_dir \
+                    and not self._custom_voices:
+                await self.load_custom_voices(self._custom_voices_dir)
             
         except Exception as e:
             logger.error(f"Failed to load official TTS backend: {e}")
             raise RuntimeError(f"Failed to initialize official TTS backend: {e}")
+
+    def unload(self) -> bool:
+        """Release the model and cached GPU resources (VRAM).
+
+        Drops the model, clears the custom-voice prompts (they live on the
+        GPU via map_location=self.device and reload from their on-disk
+        .cached_prompt.pt cache), and returns the freed blocks to the CUDA
+        allocator. Safe to call when already unloaded.
+        """
+        from .base import release_model_memory
+
+        if not self._ready or self.model is None:
+            return False
+
+        logger.info(
+            f"Unloading official backend model '{self.model_name}' "
+            f"(was on {self.device})…"
+        )
+        model = self.model
+        self.model = None
+        self._ready = False
+        if self._custom_voices:
+            logger.info(
+                f"Clearing {len(self._custom_voices)} custom voice prompt(s) "
+                "(they reload from their on-disk cache)"
+            )
+            self._custom_voices.clear()
+        release_model_memory(model)
+        logger.info("Official backend model unloaded; VRAM released")
+        return True
     
     async def generate_speech(
         self,
@@ -413,9 +456,17 @@ class OfficialQwen3TTSBackend(TTSBackend):
 
     async def load_custom_voices(self, custom_voices_dir: str) -> None:
         """Load custom voices from a directory, caching prompt artifacts."""
+        # Already loaded from the same directory (e.g. initialize() reloaded
+        # them after an unload and the factory calls again): nothing to do.
+        if self._custom_voices and self._custom_voices_dir == custom_voices_dir:
+            logger.debug(f"Custom voices from {custom_voices_dir} already loaded")
+            return
+
         voices_path = Path(custom_voices_dir)
+        self._custom_voices_dir = custom_voices_dir
         if not voices_path.exists():
             logger.info(f"Custom voices directory does not exist: {custom_voices_dir}")
+            self._custom_voices_loaded = True
             return
 
         if not self.supports_voice_cloning():
@@ -423,6 +474,7 @@ class OfficialQwen3TTSBackend(TTSBackend):
                 "Custom voices require the Base model (Qwen3-TTS-12Hz-1.7B-Base). "
                 "Skipping custom voice loading."
             )
+            self._custom_voices_loaded = True
             return
 
         import torch
@@ -519,6 +571,7 @@ class OfficialQwen3TTSBackend(TTSBackend):
             except Exception as e:
                 logger.error(f"Failed to extract custom voice '{voice_name}': {e}")
 
+        self._custom_voices_loaded = True
         if loaded:
             logger.info(f"Loaded {len(loaded)} custom voice(s): {loaded}")
         else:

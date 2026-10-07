@@ -198,6 +198,25 @@ async def _warmup_backend(backend: TTSBackend) -> None:
         ) from exc
 
 
+async def unload_backend() -> bool:
+    """Unload the global backend's model(s), releasing VRAM.
+
+    Guarded by the initialization lock so it cannot interleave with a
+    (re)initialization in progress. The caller must ensure no generation is
+    in flight (e.g. by holding the router's generation slot). Safe to call
+    when the backend does not exist or is already unloaded.
+
+    Returns:
+        True if a loaded model was released, False if there was nothing to
+        unload (backend missing, not ready, or unload unsupported).
+    """
+    async with _get_initialization_lock():
+        backend = _backend_instance
+        if backend is None or not backend.is_ready():
+            return False
+        return backend.unload()
+
+
 async def initialize_backend(warmup: bool = False) -> TTSBackend:
     """Initialize the global backend exactly once, even under concurrency."""
     global _backend_instance

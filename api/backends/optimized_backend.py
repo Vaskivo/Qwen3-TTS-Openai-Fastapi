@@ -236,26 +236,14 @@ class OptimizedQwen3TTSBackend(TTSBackend):
     def _unload_model_instance(model: Any) -> None:
         """Actually release a loaded model's VRAM.
 
-        ``del`` + ``torch.cuda.empty_cache()`` alone is NOT enough: nn.Module
-        trees hold reference cycles (parent↔child via ``_modules``, hooks), so
-        refcount-only deletion often leaves tensors live, and ``empty_cache()``
-        only returns the allocator's *free* pool — it never frees tensors that
-        are still referenced. The result is that "unloaded" models stay resident
-        in VRAM (both models visible after a swap).
-
-        To actually free the memory we drop the reference and force a
-        garbage-collection pass to break the cycles (which lets the GPU
-        tensors be released), then return the now-truly-free blocks to the
-        allocator with ``empty_cache()``. No CPU copy is needed — we don't
-        want to *move* the weights, only stop referencing them.
+        Thin wrapper around the shared :func:`release_model_memory` helper
+        (drop the reference, ``gc.collect()`` to break nn.Module cycles,
+        ``torch.cuda.empty_cache()`` to return the freed blocks to the
+        allocator). See ``api/backends/base.py`` for the full rationale.
         """
-        import gc
-        import torch
+        from .base import release_model_memory
 
-        del model
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        release_model_memory(model)
 
     def _unload_resident_models(self) -> None:
         """Unload all resident models (swap mode: keep at most one).
@@ -281,6 +269,20 @@ class OptimizedQwen3TTSBackend(TTSBackend):
             del self._models[old_key]
         self.current_model_key = None
         self._ready = False
+
+    def unload(self) -> bool:
+        """Release all resident models and cached GPU resources (VRAM).
+
+        Wraps :meth:`_unload_resident_models`, which unloads every resident
+        model instance, clears the voice-prompt cache and resets
+        ``_ready``. The next generation request re-loads lazily via
+        :meth:`_ensure_model_loaded`. Safe to call when already unloaded.
+        """
+        if not self._ready and not self._models:
+            return False
+        self._unload_resident_models()
+        logger.info("Optimized backend unloaded; VRAM released")
+        return True
 
     async def _ensure_model_loaded(self, model_key: str) -> None:
         """Ensure *model_key* is resident and make it the active model.

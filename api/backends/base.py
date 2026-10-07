@@ -12,6 +12,35 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def release_model_memory(model: Any) -> None:
+    """Actually release a loaded model's VRAM.
+
+    ``del`` + ``torch.cuda.empty_cache()`` alone is NOT enough: nn.Module
+    trees hold reference cycles (parent↔child via ``_modules``, hooks), so
+    refcount-only deletion often leaves tensors live, and ``empty_cache()``
+    only returns the allocator's *free* pool — it never frees tensors that
+    are still referenced. The result is that "unloaded" models stay resident
+    in VRAM (both models visible after a swap).
+
+    To actually free the memory we drop the reference and force a
+    garbage-collection pass to break the cycles (which lets the GPU
+    tensors be released), then return the now-truly-free blocks to the
+    allocator with ``empty_cache()``. No CPU copy is needed — we don't
+    want to *move* the weights, only stop referencing them.
+    """
+    import gc
+
+    del model
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+
+
 class TTSBackend(ABC):
     """Abstract base class for TTS backends."""
 
@@ -92,6 +121,23 @@ class TTSBackend(ABC):
             Dict with keys: device, gpu_available, gpu_name, vram_total, vram_used
         """
         pass
+
+    def unload(self) -> bool:
+        """Release the model and any cached GPU resources (VRAM).
+
+        Called by the idle-unload watchdog or the manual unload endpoint
+        when the server has been idle. Must be safe to call when the backend
+        is already unloaded, and must make ``is_ready()`` return False so
+        the next request re-initializes it (lazy load).
+
+        This is a synchronous (atomic w.r.t. the event loop) operation.
+
+        Returns:
+            True if a loaded model was released, False if there was nothing
+            to unload.
+        """
+        logger.warning("This backend does not support unloading")
+        return False
 
     def supports_voice_cloning(self) -> bool:
         """

@@ -375,6 +375,7 @@ Review device mappings in `docker-compose.rocm.yml`; render-node names vary betw
 | `TTS_STALL_TIMEOUT` | `10` | Abort a streaming generation when the client has not consumed audio for this many seconds (releases the generation slot so other requests are not blocked behind a stalled stream); `0` disables the watchdog |
 | `TTS_ACQUIRE_TIMEOUT` | `300` | Max seconds a request waits for a generation slot before failing (HTTP 503 / SSE error); `0` waits indefinitely |
 | `TTS_STREAM_QUEUE_MAX` | `32` | PCM chunks buffered between generation and the client (bounds speculative generation ahead of a slow consumer) |
+| `TTS_IDLE_UNLOAD_SECONDS` | `600` | Unload the model from VRAM after this many idle seconds; `0` disables it. Also available on demand via `POST /v1/audio/unload` |
 | `TTS_IDLE_TIMEOUT_SECONDS` | `0` | Opt-in idle shutdown; `0` disables it |
 | `CORS_ORIGINS` | `*` | Comma-separated allowed browser origins |
 | `API_KEY` | *(unset)* | When set, requires `Authorization: Bearer <key>` or `X-API-Key: <key>` on all routes except `/health`. Unset = open |
@@ -509,6 +510,17 @@ TTS_LAZY_LOAD=false TTS_WARMUP_ON_START=true python -m api.main
 ### Server exits while idle
 
 Idle shutdown is disabled by default. Check that your environment does not set a positive `TTS_IDLE_TIMEOUT_SECONDS`.
+
+## Idle model unload (free VRAM when idle)
+
+For a home server that generates speech only occasionally, a resident model wastes power and VRAM. After `TTS_IDLE_UNLOAD_SECONDS` (default `600`; `0` disables) without a **successful speech request**, the server unloads the model and any cached GPU resources while **continuing to run**. Read-only endpoints (`/health`, `/v1/models`, `/v1/voices`) do not reset the timer, so monitoring polls do not pin VRAM. The next speech request transparently re-loads the model (it pays the load latency); `/health` reports `"unloaded"` in the meantime.
+
+To unload on demand (e.g. from a home-automation script after a known burst):
+
+```bash
+curl -X POST http://localhost:8880/v1/audio/unload
+# {"status":"unloaded", ...} | {"status":"already_unloaded", ...} | 503 {"status":"busy"}
+```
 
 ## Project layout
 
