@@ -1456,6 +1456,12 @@ async def create_speech(
                     f"audio={audio_dur:.2f}s RTF={rtf:.2f}x"
                 )
 
+                # Reset the idle-unload timer on a successful generation.
+                try:
+                    note_speech_activity(client_request.app, samples=len(audio))
+                except Exception:
+                    pass
+
                 fmt = request.response_format
                 audio_bytes = await asyncio.to_thread(encode_audio, audio, fmt, sample_rate)
                 content_type = get_content_type(fmt)
@@ -1925,6 +1931,12 @@ async def create_voice_clone(
                 x_vector_only_mode=request.x_vector_only_mode,
                 speed=request.speed,
             )
+
+        # Reset the idle-unload timer on a successful generation.
+        try:
+            note_speech_activity(client_request.app, samples=len(audio))
+        except Exception:
+            pass
 
         # Encode audio to requested format (offloaded – pydub MP3 encoding is CPU-heavy)
         audio_bytes = await asyncio.to_thread(encode_audio, audio, request.response_format, sample_rate)

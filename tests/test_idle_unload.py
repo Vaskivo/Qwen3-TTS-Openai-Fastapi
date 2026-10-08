@@ -18,6 +18,8 @@ import contextlib
 import time
 from unittest.mock import AsyncMock, MagicMock
 
+import numpy as np
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -410,6 +412,106 @@ class TestManualUnloadEndpoint:
         assert response.status_code == 503
         assert response.json()["status"] == "busy"
         assert fake.unload_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# Idle-timer resets on every successful generation path
+# ---------------------------------------------------------------------------
+
+
+class TestIdleTimerResetPaths:
+    """Every successful generation path must reset the idle-unload timer.
+
+    Regression: the voice-library clone path (``clone:`` voices inside
+    /v1/audio/speech) and the /v1/audio/voice-clone endpoint used to skip
+    note_speech_activity, so a successful request was followed by an
+    immediate idle unload.
+    """
+
+    def _age_last_speech(self) -> float:
+        """Pretend the last speech request was an hour ago; return 'now'."""
+        app.state.last_speech_at = time.monotonic() - 3600
+        return time.monotonic()
+
+    @staticmethod
+    def _mock_backend(monkeypatch) -> MagicMock:
+        import numpy as np
+
+        mock = MagicMock()
+        mock.is_ready.return_value = True
+        mock.supports_voice_cloning.return_value = True
+        mock.get_model_type.return_value = "base"
+        mock.generate_voice_clone = AsyncMock(
+            return_value=(np.zeros(8, dtype=np.float32), 24000)
+        )
+        monkeypatch.setattr(backend_factory, "_backend_instance", mock)
+        monkeypatch.setattr(oc, "encode_audio", lambda *_a, **_k: b"audio")
+        return mock
+
+    def test_voice_clone_endpoint_resets_timer(self, monkeypatch):
+        self._mock_backend(monkeypatch)
+        # ref_audio decoding goes through soundfile; stub it.
+        monkeypatch.setattr(
+            oc.sf, "read", lambda *_a, **_k: (np.zeros(8, dtype=np.float32), 24000)
+        )
+
+        client = TestClient(app)
+        before = self._age_last_speech()
+        response = client.post(
+            "/v1/audio/voice-clone",
+            json={
+                "input": "hello",
+                "ref_audio": "dGVzdA==",
+                "x_vector_only_mode": True,
+                "response_format": "wav",
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert app.state.last_speech_at >= before, (
+            "a successful voice-clone request must reset the idle timer"
+        )
+
+    def test_voice_library_clone_resets_timer(self, monkeypatch, tmp_path):
+        import json as _json
+
+        self._mock_backend(monkeypatch)
+        # Voice library profile "Alice" with dummy reference audio.
+        profile_dir = tmp_path / "profiles" / "alice"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "meta.json").write_text(
+            _json.dumps(
+                {
+                    "name": "Alice",
+                    "profile_id": "alice",
+                    "ref_audio_filename": "reference.wav",
+                    "x_vector_only_mode": True,
+                    "language": "English",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (profile_dir / "reference.wav").write_bytes(b"RIFF")
+        monkeypatch.setattr(oc, "VOICE_LIBRARY_DIR", tmp_path)
+        monkeypatch.setattr(
+            oc.sf, "read", lambda *_a, **_k: (np.zeros(8, dtype=np.float32), 24000)
+        )
+        oc._ref_audio_cache.clear()
+
+        client = TestClient(app)
+        before = self._age_last_speech()
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "qwen3-tts",
+                "input": "hello",
+                "voice": "clone:Alice",
+                "response_format": "wav",
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert app.state.last_speech_at >= before, (
+            "a successful clone: voice request must reset the idle timer"
+        )
 
 
 # ---------------------------------------------------------------------------
