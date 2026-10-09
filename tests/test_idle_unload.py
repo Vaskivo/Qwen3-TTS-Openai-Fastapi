@@ -35,6 +35,17 @@ from api.routers.openai_compatible import note_speech_activity
 # ---------------------------------------------------------------------------
 
 
+class _CyclicModel:
+    """Fake model with an internal reference cycle, like an nn.Module tree
+    (parent↔child via ``_modules``). Plain refcounting cannot free such an
+    object; only a gc pass can — which is exactly what the unload path must
+    trigger *after* dropping every reference."""
+
+    def __init__(self):
+        self._modules = {}
+        self._modules["self"] = self  # cycle
+
+
 class _FakeBackend:
     """Minimal backend stand-in for watchdog / endpoint tests."""
 
@@ -291,6 +302,64 @@ class TestOptimizedBackendUnload:
         await backend._ensure_model_loaded("cv")
         assert backend.is_ready() is True
         assert backend.get_loaded_model_keys() == ["cv"]
+
+
+# ---------------------------------------------------------------------------
+# The unload must *actually* free the model (VRAM release)
+# ---------------------------------------------------------------------------
+
+
+class TestUnloadActuallyReleasesModel:
+    """Regression: gc.collect()+empty_cache() used to run while the calling
+    frame still held a reference to the model, so the weights were never
+    collected and lingered in the allocator's reserved pool — nvidia-smi
+    kept showing the memory even though the code logged a successful unload.
+    """
+
+    def test_optimized_unload_frees_cyclic_model(self, tmp_path, monkeypatch):
+        import gc
+        import weakref
+
+        backend = TestOptimizedBackendUnload()._make_backend(tmp_path, monkeypatch)
+        model = _CyclicModel()
+        backend._models["cv"] = model
+        backend.model = model
+        backend.current_model_key = "cv"
+        backend._ready = True
+        ref = weakref.ref(model)
+        del model
+
+        gc_was_enabled = gc.isenabled()
+        gc.disable()  # deterministic: only the explicit gc.collect() can free it
+        try:
+            assert backend.unload() is True
+            # If any reference survived the flush (the old bug), the cycle
+            # stays alive and the weakref is still populated.
+            assert ref() is None, "model was not actually garbage-collected"
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+
+    def test_official_unload_frees_cyclic_model(self):
+        import gc
+        import weakref
+
+        backend = TestOfficialBackendUnload()._official_backend()
+        model = _CyclicModel()
+        backend.model = model
+        backend._ready = True
+        backend.device = "cpu"
+        ref = weakref.ref(model)
+        del model
+
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            assert backend.unload() is True
+            assert ref() is None, "model was not actually garbage-collected"
+        finally:
+            if gc_was_enabled:
+                gc.enable()
 
 
 # ---------------------------------------------------------------------------

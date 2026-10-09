@@ -12,25 +12,26 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-def release_model_memory(model: Any) -> None:
-    """Actually release a loaded model's VRAM.
+def flush_cuda_memory() -> None:
+    """Break dead reference cycles and return freed GPU blocks to the driver.
 
-    ``del`` + ``torch.cuda.empty_cache()`` alone is NOT enough: nn.Module
-    trees hold reference cycles (parent↔child via ``_modules``, hooks), so
-    refcount-only deletion often leaves tensors live, and ``empty_cache()``
-    only returns the allocator's *free* pool — it never frees tensors that
-    are still referenced. The result is that "unloaded" models stay resident
-    in VRAM (both models visible after a swap).
+    nn.Module trees hold reference cycles (parent↔child via ``_modules``,
+    hooks, closures), so refcount-only deletion often leaves the weights
+    live even after every *named* reference is gone. ``gc.collect()`` breaks
+    those cycles and releases the tensors; ``torch.cuda.empty_cache()``
+    then returns the now-truly-free blocks to the driver — without it they
+    would linger in the allocator's reserved pool and keep showing as used
+    in nvidia-smi.
 
-    To actually free the memory we drop the reference and force a
-    garbage-collection pass to break the cycles (which lets the GPU
-    tensors be released), then return the now-truly-free blocks to the
-    allocator with ``empty_cache()``. No CPU copy is needed — we don't
-    want to *move* the weights, only stop referencing them.
+    IMPORTANT: call this only AFTER dropping *every* reference to the model
+    (instance attributes, dict entries, **and local variables in the
+    calling frames** — ``del`` inside a helper cannot delete the caller's
+    name). If any reference survives, ``gc.collect()`` cannot free the
+    model, the empty cache flush is a no-op, and the weights stay resident
+    in VRAM even though the code logged a successful unload.
     """
     import gc
 
-    del model
     gc.collect()
     try:
         import torch

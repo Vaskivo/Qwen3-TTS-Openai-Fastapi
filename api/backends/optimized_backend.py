@@ -232,26 +232,21 @@ class OptimizedQwen3TTSBackend(TTSBackend):
     def _model_info(self, model_key: str) -> dict:
         return self.config.get("models", {}).get(model_key, {})
 
-    @staticmethod
-    def _unload_model_instance(model: Any) -> None:
-        """Actually release a loaded model's VRAM.
-
-        Thin wrapper around the shared :func:`release_model_memory` helper
-        (drop the reference, ``gc.collect()`` to break nn.Module cycles,
-        ``torch.cuda.empty_cache()`` to return the freed blocks to the
-        allocator). See ``api/backends/base.py`` for the full rationale.
-        """
-        from .base import release_model_memory
-
-        release_model_memory(model)
-
     def _unload_resident_models(self) -> None:
         """Unload all resident models (swap mode: keep at most one).
 
         Voice-prompt cache entries are tied to a specific base-model instance,
         so clear them on unload (today's behaviour). Also clears the active
         ``self.model`` pointer if it points at a model being unloaded.
+
+        References are dropped *before* the gc/empty_cache flush runs
+        (``flush_cuda_memory``); if any reference survived — including local
+        variables in this frame — the cycle collector could not free the
+        weights and the freed blocks would linger in the allocator's
+        reserved pool (still visible in nvidia-smi).
         """
+        from .base import flush_cuda_memory
+
         if not self._models:
             return
         if self._voice_prompt_cache:
@@ -262,13 +257,17 @@ class OptimizedQwen3TTSBackend(TTSBackend):
             self._voice_prompt_cache.clear()
         for old_key in list(self._models.keys()):
             logger.info(f"Unloading {old_key!r}…")
-            instance = self._models[old_key]
-            if self.model is instance:
-                self.model = None
-            self._unload_model_instance(instance)
-            del self._models[old_key]
+        residents = list(self._models.values())
+        if self.model is not None \
+                and any(self.model is m for m in residents):
+            self.model = None
+        self._models.clear()
         self.current_model_key = None
         self._ready = False
+        # Drop our own references BEFORE collecting, so gc can actually free
+        # the model trees (nn.Module cycles defeat plain refcounting).
+        del residents
+        flush_cuda_memory()
 
     def unload(self) -> bool:
         """Release all resident models and cached GPU resources (VRAM).

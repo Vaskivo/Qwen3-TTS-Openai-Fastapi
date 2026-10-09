@@ -219,8 +219,14 @@ class OfficialQwen3TTSBackend(TTSBackend):
         GPU via map_location=self.device and reload from their on-disk
         .cached_prompt.pt cache), and returns the freed blocks to the CUDA
         allocator. Safe to call when already unloaded.
+
+        Every reference is dropped BEFORE the gc/empty_cache flush runs
+        (``flush_cuda_memory``); keeping a local alias alive across the flush
+        would prevent the cycle collector from freeing the weights and the
+        blocks would linger in the allocator's reserved pool (still visible
+        in nvidia-smi).
         """
-        from .base import release_model_memory
+        from .base import flush_cuda_memory
 
         if not self._ready or self.model is None:
             return False
@@ -229,7 +235,6 @@ class OfficialQwen3TTSBackend(TTSBackend):
             f"Unloading official backend model '{self.model_name}' "
             f"(was on {self.device})…"
         )
-        model = self.model
         self.model = None
         self._ready = False
         if self._custom_voices:
@@ -238,7 +243,7 @@ class OfficialQwen3TTSBackend(TTSBackend):
                 "(they reload from their on-disk cache)"
             )
             self._custom_voices.clear()
-        release_model_memory(model)
+        flush_cuda_memory()
         logger.info("Official backend model unloaded; VRAM released")
         return True
     
